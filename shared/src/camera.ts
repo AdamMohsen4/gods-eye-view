@@ -97,7 +97,8 @@ export function buildPose(input: PoseInput): PoseOutput {
     case 'satellite': {
       // Just behind the spacecraft, looking forward and steeply down.
       const camGeo = destination(anchor, (track + 180) % 360, 0.5);
-      const camH = input.altitudeM + 120;
+      // 950 m up over 500 m back ≈ 62° down, matching the pitch, so the spacecraft sits mid-frame.
+      const camH = input.altitudeM + 950;
       const { cam, enu } = lookAt(camGeo, camH, anchor, input.altitudeM);
       return {
         anchor,
