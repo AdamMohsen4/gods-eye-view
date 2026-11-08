@@ -1,0 +1,30 @@
+{
+  "name": "@earthnow/server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "EMBED_WORKER=1 node --env-file-if-exists=../.env --import tsx src/main.ts",
+    "start": "tsx src/main.ts",
+    "start:test": "FIXTURE_MODE=1 DATABASE_URL=memory:// SEED_ON_BOOT=1 ADMIN_TOKEN=test-admin RATE_LIMIT_MAX=100000 tsx src/main.ts",
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "@earthnow/db": "workspace:*",
+    "@earthnow/shared": "workspace:*",
+    "@earthnow/worker": "workspace:*",
+    "@fastify/rate-limit": "^10.2.1",
+    "d3-geo": "^3.1.1",
+    "drizzle-orm": "^0.44.0",
+    "fastify": "^5.2.0",
+    "sharp": "^0.34.0",
+    "topojson-client": "^3.1.0",
+    "tsx": "^4.19.2",
+    "world-atlas": "^2.0.2"
+  },
+  "devDependencies": {
+    "@types/d3-geo": "^3.1.0",
+    "@types/geojson": "^7946.0.14",
+    "@types/topojson-client": "^3.1.5",
+    "@types/topojson-specification": "^1.0.5"
+  }
+}
