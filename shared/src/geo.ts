@@ -88,3 +88,31 @@ export function localSolarTime(atIso: string, lon: number): string {
   const d = new Date(t);
   return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
 }
+
+/** Solar elevation in degrees at a place and time (NOAA approximation, ±0.5°). */
+export function sunElevationDeg(atIso: string, p: LatLon): number {
+  const d = new Date(atIso);
+  const jd = d.getTime() / 86_400_000 + 2440587.5;
+  const n = jd - 2451545.0;
+  const L = (280.46 + 0.9856474 * n) % 360;
+  const g = ((357.528 + 0.9856003 * n) % 360) * D2R;
+  const λ = (L + 1.915 * Math.sin(g) + 0.02 * Math.sin(2 * g)) * D2R;
+  const ε = (23.439 - 0.0000004 * n) * D2R;
+  const δ = Math.asin(Math.sin(ε) * Math.sin(λ));
+  const α = Math.atan2(Math.cos(ε) * Math.sin(λ), Math.cos(λ));
+  const gmst = (18.697374558 + 24.06570982441908 * n) % 24;
+  const H = ((gmst * 15 + p.lon) * D2R - α);
+  const φ = p.lat * D2R;
+  return Math.asin(Math.sin(φ) * Math.sin(δ) + Math.cos(φ) * Math.cos(δ) * Math.cos(H)) * R2D;
+}
+
+/**
+ * How much a player can see: daylight and land give real context, a night
+ * over open ocean gives none. 0–2. Used to prefer good scenes, never to
+ * relax a safety filter.
+ */
+export function sceneQuality(atIso: string, p: LatLon, overLand: boolean): number {
+  // Polar ice sheets are land but featureless, and imagery there is sparse.
+  const landWithFeatures = overLand && Math.abs(p.lat) < 62;
+  return (landWithFeatures ? 1 : 0) + (sunElevationDeg(atIso, p) > 8 ? 1 : 0);
+}

@@ -5,6 +5,8 @@ import { fetchQuakes } from './providers/usgs.ts';
 import { fetchFires } from './providers/firms.ts';
 import { fetchSatellites } from './providers/celestrak.ts';
 import { clusterFires, filterAircraft, filterFire, filterQuake, filterSatellite, type Verdict } from './filters.ts';
+import { sceneQuality } from '@earthnow/shared';
+import { countryAt } from './country.ts';
 import { freezeFire, freezeFlight, freezeQuake, freezeSatellite } from './freeze.ts';
 
 export interface PollStats {
@@ -28,8 +30,13 @@ function tally<T>(items: T[], check: (t: T) => Verdict) {
   return { passed, rejected };
 }
 
-function sample<T>(items: T[], n: number): T[] {
-  return [...items].sort(() => Math.random() - 0.5).slice(0, n);
+/** Random pick that prefers daylight-over-land scenes (gameplay, not safety). */
+function sampleByScene<T extends { lat?: number; lon?: number }>(items: T[], n: number, at: Date): T[] {
+  const scored = items.map((x) => {
+    const p = { lat: x.lat!, lon: x.lon! };
+    return { x, q: sceneQuality(at.toISOString(), p, countryAt(p.lat, p.lon) !== null) + Math.random() * 0.9 };
+  });
+  return scored.sort((a, b) => b.q - a.q).slice(0, n).map((s) => s.x);
 }
 
 async function insert(db: Db, rows: NewSnapshot[]): Promise<number> {
@@ -41,14 +48,14 @@ async function insert(db: Db, rows: NewSnapshot[]): Promise<number> {
 export async function pollFlights(db: Db, now = new Date()): Promise<PollStats> {
   const { items } = await fetchAircraft();
   const { passed, rejected } = tally(items, filterAircraft);
-  const rows = sample(passed, MAX_PER_POLL.flight).map((a) => freezeFlight(a, now));
+  const rows = sampleByScene(passed, MAX_PER_POLL.flight, now).map((a) => freezeFlight(a, now));
   return { provider: 'flights', candidates: items.length, passed: passed.length, inserted: await insert(db, rows), rejected };
 }
 
 export async function pollSatellites(db: Db, now = new Date()): Promise<PollStats> {
   const { items } = await fetchSatellites(now);
   const { passed, rejected } = tally(items, filterSatellite);
-  const rows = sample(passed, MAX_PER_POLL.satellite).map((s) => freezeSatellite(s, now));
+  const rows = sampleByScene(passed, MAX_PER_POLL.satellite, now).map((s) => freezeSatellite(s, now));
   return { provider: 'satellites', candidates: items.length, passed: passed.length, inserted: await insert(db, rows), rejected };
 }
 

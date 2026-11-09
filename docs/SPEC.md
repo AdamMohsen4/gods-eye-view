@@ -177,20 +177,20 @@ Legend: `[x]` done in code · `[~]` partly done (see note) · `[ ]` open. Items 
 
 **M2 — Play experience (weeks 4–5)**
 
-- [ ] Labelless view per round type; clue chips; guess map; reveal fly-to
-- [~] Daily Earth generator, admin preview and swap — generator + admin API done; admin UI in client
+- [x] Labelless view per round type; clue chips; guess map; reveal fly-to (free leashed navigation, see ADR-007)
+- [x] Daily Earth generator, admin preview and swap (admin at `/admin.html`, bearer token until Clerk)
 - [~] Guest play, then Clerk sign-in with streak merge — guest play done; Clerk deferred **(owner: Clerk account)**
 
 **M3 — Social and growth (week 6)**
 
-- [ ] Share text and OG image; share page opens the Daily directly
+- [x] Share text and OG image; share page opens the Daily directly
 - [x] Streaks, freezes, leaderboards (global, country, friends) — friends waits for accounts
 
 **M4 — Plus and hardening (week 7)**
 
-- [ ] Stripe Plus; Arcade limits by plan — limits by plan done; Stripe deferred **(owner: Stripe account)**
+- [~] Stripe Plus; Arcade limits by plan — limits by plan done; Stripe deferred **(owner: Stripe account)**
 - [~] Rate limits, server-side keys, GDPR deletion, consent banner — rate limits, server-side keys, deletion done; no analytics yet, so no consent banner needed
-- [ ] Mobile performance pass against the budget
+- [~] Mobile performance pass against the budget — first round interactive ≈ 4.0 s on a throttled 4G profile (software GL); tile load 1.4–4.2 s per round; needs a real mid-range Android
 
 **M5 — Beta (week 8)**
 

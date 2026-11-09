@@ -1,5 +1,5 @@
 import type { CameraPose, LatLon, RoundType, SceneSubject } from './types.ts';
-import { destination, ecefToGeodetic, geodeticToEcef } from './geo.ts';
+import { destination, ecefToGeodetic, geodeticToEcef, haversineKm } from './geo.ts';
 import { seededRandom } from './random.ts';
 
 const D2R = Math.PI / 180;
@@ -81,36 +81,44 @@ export function buildPose(input: PoseInput): PoseOutput {
   const [dMin, dMax] = DISPLACEMENT_KM[input.type];
   const anchor = destination(input.truth, rnd() * 360, dMin + rnd() * (dMax - dMin));
   const track = Number.isFinite(input.headingDeg) ? (input.headingDeg as number) : rnd() * 360;
+  /** Camera ground point `km` from the anchor; flipped if it would land near the truth. */
+  const placeCamera = (bearing: number, km: number): LatLon => {
+    const g = destination(anchor, bearing, km);
+    return haversineKm(g, input.truth) >= MIN_DISPLACEMENT_KM + 0.5 ? g : destination(anchor, (bearing + 180) % 360, km);
+  };
 
   switch (input.type) {
     case 'flight': {
-      // Chase view: camera just behind and above the aircraft, looking along track.
-      const camGeo = destination(anchor, (track + 180) % 360, 0.16);
-      const camH = input.altitudeM + 35;
+      // Above and behind the aircraft, looking down past it at the ground it
+      // is crossing, so coastlines and terrain are in frame (not just horizon).
+      const camGeo = placeCamera((track + 180) % 360, 0.35);
+      const camH = input.altitudeM + 120;
       const { cam, enu } = lookAt(camGeo, camH, anchor, input.altitudeM);
       return {
         anchor,
-        camera: { position: cam, heading: track * D2R, pitch: -7 * D2R, roll: 0, fov: 62 },
+        camera: { position: cam, heading: track * D2R, pitch: -22 * D2R, roll: 0, fov: 60 },
         subject: { kind: 'flight', offsetEnu: round3(enu), headingDeg: track },
       };
     }
     case 'satellite': {
-      // Just behind the spacecraft, looking forward and steeply down.
-      const camGeo = destination(anchor, (track + 180) % 360, 0.5);
-      // 950 m up over 500 m back ≈ 62° down, matching the pitch, so the spacecraft sits mid-frame.
-      const camH = input.altitudeM + 950;
-      const { cam, enu } = lookAt(camGeo, camH, anchor, input.altitudeM);
+      // The spacecraft is hundreds of km up; showing it from orbit gives no
+      // ground context. Instead the scene is the ground it is passing over: the
+      // subject is its nadir point (drawn with the ground track), seen from
+      // 90 km up, looking along the track.
+      const camGeo = placeCamera((track + 180) % 360, 75);
+      const camH = 90_000;
+      const { cam, enu, pitch } = lookAt(camGeo, camH, anchor, 0);
       return {
         anchor,
-        camera: { position: cam, heading: track * D2R, pitch: -62 * D2R, roll: 0, fov: 60 },
+        camera: { position: cam, heading: track * D2R, pitch, roll: 0, fov: 60 },
         subject: { kind: 'satellite', offsetEnu: round3(enu), headingDeg: track },
       };
     }
     case 'quake':
     case 'fire': {
-      const backKm = input.type === 'quake' ? 70 : 22;
-      const camH = input.type === 'quake' ? 42_000 : 7_500;
-      const camGeo = destination(anchor, rnd() * 360, backKm);
+      const backKm = input.type === 'quake' ? 40 : 18;
+      const camH = input.type === 'quake' ? 26_000 : 6_500;
+      const camGeo = placeCamera(rnd() * 360, backKm);
       const { cam, enu, heading, pitch } = lookAt(camGeo, camH, anchor, 0);
       return {
         anchor,

@@ -1,6 +1,6 @@
 import { and, desc, eq, gte, sql } from 'drizzle-orm';
 import { dailies, snapshots, rowsOf, type Db, type SnapshotRow } from '@earthnow/db';
-import { ROUND_TYPES, addDays, dailyNumber, haversineKm, seededRandom, utcDate, type RoundType } from '@earthnow/shared';
+import { ROUND_TYPES, addDays, dailyNumber, haversineKm, sceneQuality, seededRandom, utcDate, type RoundType } from '@earthnow/shared';
 
 export const DAILY_ROUNDS = 5;
 /** Rounds in one daily should be spread out; picks closer than this are skipped. */
@@ -40,7 +40,11 @@ export async function pickDailySnapshots(db: Db, date: string, opts: { freshHour
 
   const rnd = seededRandom(`daily:${date}`);
   const shuffle = <T>(xs: T[]) => xs.map((x) => [rnd(), x] as const).sort((a, b) => a[0] - b[0]).map(([, x]) => x);
-  const byType = new Map<RoundType, SnapshotRow[]>(ROUND_TYPES.map((t) => [t, shuffle(rows.filter((r) => r.type === t))]));
+  // Within each type, best scenes first (daylight, over land), random within a tier.
+  const quality = (r: SnapshotRow) =>
+    sceneQuality(r.eventAt.toISOString(), { lat: r.trueLat, lon: r.trueLon }, !!(r.payload as { fact?: { country?: string | null } }).fact?.country);
+  const ranked = (xs: SnapshotRow[]) => shuffle(xs).sort((a, b) => quality(b) - quality(a));
+  const byType = new Map<RoundType, SnapshotRow[]>(ROUND_TYPES.map((t) => [t, ranked(rows.filter((r) => r.type === t))]));
 
   const picked: SnapshotRow[] = [];
   const farEnough = (r: SnapshotRow) =>
@@ -52,7 +56,7 @@ export async function pickDailySnapshots(db: Db, date: string, opts: { freshHour
   };
   for (const type of ROUND_TYPES) take(byType.get(type) ?? []);
   // Wildcard: the "most live" types first.
-  const wildPool = shuffle([...(byType.get('flight') ?? []), ...(byType.get('satellite') ?? []), ...rows]);
+  const wildPool = ranked([...(byType.get('flight') ?? []), ...(byType.get('satellite') ?? []), ...rows]);
   while (picked.length < DAILY_ROUNDS && take(wildPool)) {
     /* keep taking */
   }

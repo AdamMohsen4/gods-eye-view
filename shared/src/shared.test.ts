@@ -50,7 +50,7 @@ describe('camera poses never pinpoint the truth', () => {
   const truth = { lat: 52.1, lon: 4.9 };
   for (const type of ROUND_TYPES) {
     it(type, () => {
-      for (let i = 0; i < 50; i++) {
+      for (let i = 0; i < 500; i++) {
         const alt = type === 'flight' ? 11000 : type === 'satellite' ? 420_000 : 0;
         const pose = buildPose({ type, truth, altitudeM: alt, headingDeg: 45, seed: `s${i}` });
         const cam = cameraGeo(pose.camera);
@@ -97,5 +97,14 @@ describe('dates', () => {
   it('iso week', () => {
     expect(isoWeek('2026-11-09')).toBe('2026-W46');
     expect(isoWeek('2027-01-01')).toBe('2026-W53');
+  });
+});
+
+import { sunElevationDeg } from './index.ts';
+describe('sun elevation', () => {
+  it('is high at noon on the equator at equinox and negative at midnight', () => {
+    expect(sunElevationDeg('2026-03-20T12:00:00Z', { lat: 0, lon: 0 })).toBeGreaterThan(80);
+    expect(sunElevationDeg('2026-03-20T00:00:00Z', { lat: 0, lon: 0 })).toBeLessThan(-80);
+    expect(sunElevationDeg('2026-06-21T12:00:00Z', { lat: 59.3, lon: 18 })).toBeGreaterThan(45);
   });
 });
