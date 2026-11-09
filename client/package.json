@@ -1,0 +1,32 @@
+{
+  "name": "@earthnow/client",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 5173",
+    "build": "vite build",
+    "preview": "vite preview --port 5173 --strictPort",
+    "typecheck": "tsc -p .",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "@earthnow/shared": "workspace:*",
+    "cesium": "^1.124.0",
+    "d3-geo": "^3.1.1",
+    "d3-selection": "^3.0.0",
+    "d3-zoom": "^3.0.0",
+    "topojson-client": "^3.1.0",
+    "world-atlas": "^2.0.2"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0",
+    "@types/d3-geo": "^3.1.0",
+    "@types/d3-selection": "^3.0.11",
+    "@types/d3-zoom": "^3.0.8",
+    "@types/geojson": "^7946.0.14",
+    "@types/topojson-client": "^3.1.5",
+    "@types/topojson-specification": "^1.0.5",
+    "vite": "^6.0.0",
+    "vite-plugin-static-copy": "^2.2.0"
+  }
+}
