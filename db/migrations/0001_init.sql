@@ -4,69 +4,107 @@ CREATE TABLE IF NOT EXISTS users (
   guest_id uuid UNIQUE,
   display_name text NOT NULL,
   country char(2),
-  plan text NOT NULL DEFAULT 'free',
+  rating integer NOT NULL DEFAULT 1000,
+  xp integer NOT NULL DEFAULT 0,
+  daily_streak integer NOT NULL DEFAULT 0,
+  daily_best integer NOT NULL DEFAULT 0,
+  last_daily date,
   banned boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS snapshots (
+CREATE TABLE IF NOT EXISTS maps (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  type text NOT NULL,
-  source text NOT NULL,
-  dedupe_key text NOT NULL UNIQUE,
-  captured_at timestamptz NOT NULL,
-  event_at timestamptz NOT NULL,
-  true_lat double precision NOT NULL,
-  true_lon double precision NOT NULL,
-  payload jsonb NOT NULL,
-  camera_pose jsonb NOT NULL,
-  subject jsonb NOT NULL,
-  clues jsonb NOT NULL,
-  disabled boolean NOT NULL DEFAULT false,
+  slug text NOT NULL UNIQUE,
+  name text NOT NULL,
+  description text NOT NULL DEFAULT '',
+  kind text NOT NULL DEFAULT 'community',
+  creator_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  published boolean NOT NULL DEFAULT false,
+  sort integer NOT NULL DEFAULT 100,
   created_at timestamptz NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS snapshots_type_captured ON snapshots (type, captured_at DESC);
 
-CREATE TABLE IF NOT EXISTS dailies (
+CREATE TABLE IF NOT EXISTS locations (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  date date NOT NULL UNIQUE,
-  number integer NOT NULL,
-  snapshot_ids uuid[] NOT NULL,
-  generated_at timestamptz NOT NULL DEFAULT now()
+  map_id uuid NOT NULL REFERENCES maps(id) ON DELETE CASCADE,
+  provider text NOT NULL,
+  pano_id text NOT NULL,
+  lat double precision NOT NULL,
+  lon double precision NOT NULL,
+  heading double precision NOT NULL DEFAULT 0,
+  country char(2),
+  credit text,
+  disabled boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (map_id, provider, pano_id)
+);
+CREATE INDEX IF NOT EXISTS locations_map_provider ON locations (map_id, provider) WHERE NOT disabled;
+
+CREATE TABLE IF NOT EXISTS challenges (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  token text NOT NULL UNIQUE,
+  map_id uuid NOT NULL REFERENCES maps(id) ON DELETE CASCADE,
+  settings jsonb NOT NULL,
+  location_ids uuid[] NOT NULL,
+  creator_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  daily_date date UNIQUE,
+  created_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS rounds (
+CREATE TABLE IF NOT EXISTS games (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  snapshot_id uuid NOT NULL REFERENCES snapshots(id),
+  map_id uuid NOT NULL REFERENCES maps(id) ON DELETE CASCADE,
   mode text NOT NULL,
-  daily_date date,
+  challenge_id uuid REFERENCES challenges(id) ON DELETE CASCADE,
+  settings jsonb NOT NULL,
+  provider text NOT NULL,
+  scale_km double precision NOT NULL,
+  status text NOT NULL DEFAULT 'active',
+  total_score integer NOT NULL DEFAULT 0,
+  total_distance_km double precision NOT NULL DEFAULT 0,
+  streak integer NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  finished_at timestamptz
+);
+CREATE UNIQUE INDEX IF NOT EXISTS games_one_per_challenge ON games (user_id, challenge_id) WHERE challenge_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS games_user_created ON games (user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS games_challenge_score ON games (challenge_id, total_score DESC) WHERE status = 'finished';
+
+CREATE TABLE IF NOT EXISTS game_rounds (
+  game_id uuid NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+  idx integer NOT NULL,
+  location_id uuid NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
   started_at timestamptz NOT NULL DEFAULT now(),
   deadline timestamptz,
   guess_lat double precision,
   guess_lon double precision,
+  guess_country char(2),
   guessed_at timestamptz,
-  clues_used integer NOT NULL DEFAULT 0,
   distance_km double precision,
   score integer,
   timed_out boolean NOT NULL DEFAULT false,
-  UNIQUE (user_id, snapshot_id)
-);
-CREATE INDEX IF NOT EXISTS rounds_daily ON rounds (daily_date, user_id) WHERE mode = 'daily';
-CREATE INDEX IF NOT EXISTS rounds_user_started ON rounds (user_id, started_at DESC);
-
-CREATE TABLE IF NOT EXISTS streaks (
-  user_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-  current integer NOT NULL DEFAULT 0,
-  best integer NOT NULL DEFAULT 0,
-  freeze_available boolean NOT NULL DEFAULT true,
-  freeze_week text,
-  last_completed date
+  PRIMARY KEY (game_id, idx)
 );
 
-CREATE TABLE IF NOT EXISTS subscriptions (
-  user_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-  stripe_sub_id text UNIQUE,
-  status text NOT NULL,
-  renews_at timestamptz
+CREATE TABLE IF NOT EXISTS matches (
+  id uuid PRIMARY KEY,
+  format text NOT NULL,
+  ranked boolean NOT NULL DEFAULT false,
+  map_id uuid REFERENCES maps(id) ON DELETE SET NULL,
+  settings jsonb NOT NULL,
+  winner_id uuid,
+  summary jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  finished_at timestamptz
 );
+
+CREATE TABLE IF NOT EXISTS match_players (
+  match_id uuid NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  total integer NOT NULL DEFAULT 0,
+  won boolean NOT NULL DEFAULT false,
+  rating_change integer NOT NULL DEFAULT 0,
+  PRIMARY KEY (match_id, user_id)
+)

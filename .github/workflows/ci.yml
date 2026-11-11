@@ -8,7 +8,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     env:
-      FIXTURE_MODE: '1'
+      IMAGERY_PROVIDER: fixture
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

@@ -1,47 +1,14 @@
-# Third-party software notices
+# Third-party notices
 
-The project depends on third-party npm packages whose own licenses apply. This
-file records the packages added for the browser-local SDR feature and the
-Street Level viewer; the complete resolved dependency inventory remains in
-`package-lock.json`.
+The resolved dependency inventory is in `pnpm-lock.yaml`. Notable components and data:
 
-## Web RTL-SDR
+- **MapillaryJS** 4.1.2 — MIT, © Facebook, Inc. and its affiliates. <https://github.com/mapillary/mapillary-js>
+- **MapLibre GL JS** — BSD-3-Clause. <https://github.com/maplibre/maplibre-gl-js>
+- **OpenFreeMap / OpenMapTiles / OpenStreetMap** — map tiles; OSM data ODbL, OpenMapTiles CC BY 4.0.
+- **Natural Earth** via `world-atlas` — public domain.
+- **GeoNames** via `all-the-cities` — CC BY 4.0 (location candidates, server-side only).
+- **i18n-iso-countries** — MIT.
+- **Mapillary imagery** — CC BY-SA 4.0, credited per image on reveal.
+- **Google Maps Platform** — used under Google's terms when `IMAGERY_PROVIDER=google`.
 
-- Package: `@jtarrio/webrtlsdr` 3.0.6
-- Author: Jacobo Tarrio Barreiro; portions copyright Google Inc.
-- Source: <https://github.com/jtarrio/webrtlsdr>
-- License: Apache License 2.0
-- License text: <https://www.apache.org/licenses/LICENSE-2.0>
-
-## Signals
-
-- Package: `@jtarrio/signals` 0.10.1
-- Author: Jacobo Tarrio Barreiro
-- Source: <https://github.com/jtarrio/signals>
-- License: Apache License 2.0
-- License text: <https://www.apache.org/licenses/LICENSE-2.0>
-
-## MapillaryJS
-
-- Package: `mapillary-js` 4.1.2 (loaded on demand by the Street Level viewer,
-  with its stylesheet `dist/mapillary.css`)
-- Author: Copyright (c) Facebook, Inc. and its affiliates
-- Source: <https://github.com/mapillary/mapillary-js>
-- License: MIT
-- License text: <https://github.com/mapillary/mapillary-js/blob/main/LICENSE>
-
-## RxJS (MapillaryJS dependency)
-
-- Package: `rxjs` 7.8.2
-- Author: Google, Inc., Netflix, Inc., Microsoft Corp. and contributors
-- Source: <https://github.com/ReactiveX/rxjs>
-- License: Apache License 2.0
-- License text: <https://www.apache.org/licenses/LICENSE-2.0>
-
-## three.js (MapillaryJS dependency)
-
-- Package: `three` 0.134.0
-- Author: Copyright © 2010-2021 three.js authors
-- Source: <https://github.com/mrdoob/three.js>
-- License: MIT
-- License text: <https://github.com/mrdoob/three.js/blob/dev/LICENSE>
+Earlier versions of this repo were a fork of God's Eye View (MIT, see `LICENSE`); no code from it remains.

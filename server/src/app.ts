@@ -1,31 +1,38 @@
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import rateLimit from '@fastify/rate-limit';
+import websocket from '@fastify/websocket';
 import { timingSafeEqual } from 'node:crypto';
-import { and, desc, eq, gte, sql } from 'drizzle-orm';
-import { dailies, rowsOf, snapshots, users, type Db, type UserRow } from '@earthnow/db';
-import { utcDate, type RoundType } from '@earthnow/shared';
-import { DailyLockedError, generateDaily, isPublished } from '@earthnow/worker';
+import { and, eq, sql } from 'drizzle-orm';
+import { challenges, games, locations, users, rowsOf, type Db, type UserRow } from '@earthnow/db';
+import { dailyNumber, isLatLon, type PublicConfig } from '@earthnow/shared';
 import type { Config } from './config.ts';
+import { countryAt, countryRef } from './countries.ts';
 import { Game, GameError } from './game.ts';
-import { ALL_ATTRIBUTIONS } from './attributions.ts';
+import { MapMaker } from './mapmaker.ts';
+import { Hub, type HubOptions } from './multiplayer/hub.ts';
+import { ProviderUnavailable } from './imagery/index.ts';
 import { shareCardPng } from './shareImage.ts';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const DATE = /^\d{4}-\d{2}-\d{2}$/;
+const TOKEN = /^[A-Za-z0-9-]{4,40}$/;
+const SLUG = /^[a-z0-9-]{1,60}$/;
 
 export interface AppOptions {
   db: Db;
   config: Config;
   now?: () => Date;
   logger?: boolean;
+  hub?: HubOptions;
 }
 
-export async function buildApp({ db, config, now = () => new Date(), logger = false }: AppOptions) {
+export async function buildApp({ db, config, now = () => new Date(), logger = false, hub: hubOpts }: AppOptions) {
   const app = Fastify({ logger, trustProxy: true, bodyLimit: 16 * 1024 });
   const game = new Game(db, config, now);
+  const maker = new MapMaker(db, config);
+  const hub = new Hub(db, game, config, hubOpts);
 
-  // Rate-limit every public endpoint (per IP). Redis store can be plugged in for multi-instance.
   await app.register(rateLimit, { global: true, max: config.rateLimitMax, timeWindow: '1 minute' });
+  await app.register(websocket, { options: { maxPayload: 4096 } });
 
   app.addHook('onSend', async (_req, reply, payload) => {
     reply.header('x-content-type-options', 'nosniff');
@@ -35,7 +42,7 @@ export async function buildApp({ db, config, now = () => new Date(), logger = fa
 
   app.setErrorHandler((error: Error & { statusCode?: number }, _req, reply) => {
     if (error instanceof GameError) return reply.status(error.status).send({ error: error.code, ...error.extra });
-    if (error instanceof DailyLockedError) return reply.status(409).send({ error: 'daily_locked' });
+    if (error instanceof ProviderUnavailable) return reply.status(503).send({ error: 'imagery_unavailable', detail: error.message });
     if (error.statusCode === 429) return reply.status(429).send({ error: 'rate_limited' });
     if (error.statusCode && error.statusCode < 500) return reply.status(error.statusCode).send({ error: 'bad_request' });
     app.log.error(error);
@@ -53,183 +60,185 @@ export async function buildApp({ db, config, now = () => new Date(), logger = fa
     return user;
   }
   const must = async (req: FastifyRequest) => (await player(req))!;
+  const body = (req: FastifyRequest) => (req.body ?? {}) as Record<string, unknown>;
+  const uuidParam = (v: string) => {
+    if (!UUID.test(v)) throw new GameError(400, 'invalid_id');
+    return v;
+  };
 
-  /* ------------------------------ player API ------------------------------ */
+  /* ------------------------------- realtime ------------------------------ */
+
+  app.get('/ws', { websocket: true }, (socket) => {
+    const onMessage = hub.connect(socket);
+    socket.on('message', (data: Buffer) => void onMessage(data.toString()));
+    socket.on('close', () => hub.disconnect(socket));
+  });
+
+  /* -------------------------------- basics ------------------------------- */
 
   app.get('/api/health', async () => ({ ok: true }));
-  app.get('/api/attributions', async () => ALL_ATTRIBUTIONS);
+  app.get('/api/config', async (): Promise<PublicConfig> => ({
+    provider: config.provider,
+    mapillaryToken: config.provider === 'mapillary' ? config.mapillaryClientToken : null,
+    googleKey: config.provider === 'google' ? config.googleBrowserKey : null,
+    mapStyle: config.mapStyle,
+  }));
+
+  /** Which country a map point is in (streak mode shows it before you lock in). */
+  app.get<{ Querystring: { lat?: string; lon?: string } }>('/api/geo/country', async (req) => {
+    const p = { lat: Number(req.query.lat), lon: Number(req.query.lon) };
+    if (!isLatLon(p)) throw new GameError(400, 'invalid_point');
+    return { country: countryRef(countryAt(p)) };
+  });
 
   app.get('/api/me', async (req) => game.me(await must(req)));
-  app.put('/api/me', async (req) => game.updateMe(await must(req), (req.body ?? {}) as Record<string, unknown>));
+  app.put('/api/me', async (req) => game.updateMe(await must(req), body(req)));
   app.delete('/api/me', async (req, reply) => {
     await game.deleteMe(await must(req));
     return reply.status(204).send();
   });
+  app.get('/api/me/stats', async (req) => game.stats(await must(req)));
 
-  app.get('/api/daily/today', async (req) => game.today(await player(req, false)));
+  /* --------------------------------- maps -------------------------------- */
 
-  app.post('/api/rounds/start', async (req) => {
-    const body = (req.body ?? {}) as { snapshotId?: unknown; mode?: unknown };
-    if (typeof body.snapshotId !== 'string' || !UUID.test(body.snapshotId) || body.mode !== 'daily')
-      throw new GameError(400, 'invalid_request');
-    return game.startDaily(await must(req), body.snapshotId);
+  app.get<{ Querystring: { kind?: string } }>('/api/maps', async (req) => {
+    const kind = req.query.kind === 'official' || req.query.kind === 'community' ? req.query.kind : undefined;
+    return game.listMaps(kind);
+  });
+  app.get<{ Params: { slug: string } }>('/api/maps/:slug', async (req) => {
+    if (!SLUG.test(req.params.slug)) throw new GameError(400, 'invalid_map');
+    const m = await game.mapBySlug(req.params.slug);
+    const me = await player(req, false);
+    if (!m.published && m.creatorId !== me?.id) throw new GameError(404, 'map_not_found');
+    return game.mapSummary(m);
+  });
+  app.get<{ Params: { slug: string }; Querystring: { mode?: string } }>('/api/maps/:slug/leaderboard', async (req) => {
+    if (!SLUG.test(req.params.slug)) throw new GameError(400, 'invalid_map');
+    return game.mapLeaderboard(req.params.slug, req.query.mode === 'streak' ? 'streak' : 'classic');
   });
 
-  app.post<{ Params: { id: string } }>('/api/rounds/:id/clue', async (req) => game.clue(await must(req), req.params.id));
-  app.post<{ Params: { id: string } }>('/api/rounds/:id/guess', async (req) => {
-    const body = (req.body ?? {}) as { guess?: unknown };
-    if (!('guess' in body)) throw new GameError(400, 'invalid_guess');
-    return game.guess(await must(req), req.params.id, body.guess);
+  /* -------------------------------- games -------------------------------- */
+
+  app.post('/api/games', async (req) => game.startGame(await must(req), body(req)));
+  app.get<{ Params: { id: string } }>('/api/games/:id', async (req) => game.state(await must(req), uuidParam(req.params.id)));
+  app.post<{ Params: { id: string } }>('/api/games/:id/guess', async (req) => {
+    const b = body(req);
+    if (!('guess' in b)) throw new GameError(400, 'invalid_guess');
+    return game.guess(await must(req), uuidParam(req.params.id), b.guess);
+  });
+  app.post<{ Params: { id: string } }>('/api/games/:id/next', async (req) => game.next(await must(req), uuidParam(req.params.id)));
+
+  /* ----------------------------- challenges ------------------------------ */
+
+  app.get('/api/daily', async (req) => game.dailyInfo(await player(req, false)));
+  app.post('/api/challenges', { config: { rateLimit: { max: 30 } } }, async (req) => game.createChallenge(await must(req), body(req)));
+  app.get<{ Params: { token: string } }>('/api/challenges/:token', async (req) => {
+    if (!TOKEN.test(req.params.token)) throw new GameError(400, 'invalid_token');
+    return game.challengeInfo(await player(req, false), req.params.token);
+  });
+  app.post<{ Params: { token: string } }>('/api/challenges/:token/play', async (req) => {
+    if (!TOKEN.test(req.params.token)) throw new GameError(400, 'invalid_token');
+    return game.playChallenge(await must(req), req.params.token);
+  });
+  app.get<{ Params: { token: string } }>('/api/challenges/:token/leaderboard', async (req) => {
+    if (!TOKEN.test(req.params.token)) throw new GameError(400, 'invalid_token');
+    const me = await player(req, false);
+    const info = await game.challengeInfo(me, req.params.token);
+    if (!info.finished) throw new GameError(403, 'finish_first');
+    return game.challengeLeaderboard(me, req.params.token);
   });
 
-  app.get('/api/arcade/next', { config: { rateLimit: { max: Math.min(30, config.rateLimitMax) } } }, async (req) =>
-    game.nextArcade(await must(req)),
+  app.get('/api/leaderboard/rating', async () => game.ratingLeaderboard());
+
+  /* ------------------------------ map maker ------------------------------ */
+
+  app.get('/api/maker/maps', async (req) => maker.mine(await must(req)));
+  app.post('/api/maker/maps', async (req) => maker.create(await must(req), body(req)));
+  app.get<{ Params: { id: string } }>('/api/maker/maps/:id', async (req) => maker.get(await must(req), uuidParam(req.params.id)));
+  app.patch<{ Params: { id: string } }>('/api/maker/maps/:id', async (req) => maker.update(await must(req), uuidParam(req.params.id), body(req)));
+  app.delete<{ Params: { id: string } }>('/api/maker/maps/:id', async (req, reply) => {
+    await maker.remove(await must(req), uuidParam(req.params.id));
+    return reply.status(204).send();
+  });
+  app.post<{ Params: { id: string } }>('/api/maker/maps/:id/locations', { config: { rateLimit: { max: 120 } } }, async (req) =>
+    maker.addLocation(await must(req), uuidParam(req.params.id), body(req).point),
   );
-
-  app.get<{ Params: { date: string } }>('/api/daily/:date/summary', async (req) => {
-    if (!DATE.test(req.params.date)) throw new GameError(400, 'invalid_date');
-    return game.summary(await must(req), req.params.date);
+  app.delete<{ Params: { id: string; loc: string } }>('/api/maker/maps/:id/locations/:loc', async (req, reply) => {
+    await maker.removeLocation(await must(req), uuidParam(req.params.id), uuidParam(req.params.loc));
+    return reply.status(204).send();
   });
 
-  app.get<{ Querystring: { scope?: string; date?: string } }>('/api/leaderboard', async (req) => {
-    const scope = req.query.scope === 'country' ? 'country' : 'global';
-    const date = req.query.date && DATE.test(req.query.date) ? req.query.date : utcDate(now());
-    return game.leaderboard(await player(req, false), scope, date);
-  });
+  /* -------------------------------- share -------------------------------- */
 
-  /* -------------------------------- share --------------------------------- */
-
-  async function shareData(number: number, userId: string) {
-    if (!UUID.test(userId) || !Number.isInteger(number)) return null;
-    const [d] = await db.select().from(dailies).where(eq(dailies.number, number));
-    const [u] = await db.select().from(users).where(eq(users.id, userId));
-    if (!d || !u || u.banned) return null;
-    return { daily: d, summary: await game.summary(u, d.date) };
+  async function sharedGame(gameId: string) {
+    if (!UUID.test(gameId)) return null;
+    const [g] = await db.select().from(games).where(and(eq(games.id, gameId), eq(games.status, 'finished')));
+    if (!g || g.mode === 'streak') return null;
+    const [u] = await db.select().from(users).where(eq(users.id, g.userId));
+    if (!u || u.banned) return null;
+    const scores = rowsOf<{ score: number }>(await db.execute(sql`SELECT coalesce(score, 0)::int AS score FROM game_rounds WHERE game_id = ${g.id} ORDER BY idx`)).map((r) => r.score);
+    const [c] = g.challengeId ? await db.select().from(challenges).where(eq(challenges.id, g.challengeId)) : [];
+    const state = await game.state(u, g.id);
+    const title = c?.dailyDate ? `Earthnow Daily #${dailyNumber(c.dailyDate)}` : `Earthnow · ${state.map.name}`;
+    return { g, u, scores, c, title };
   }
 
-  app.get<{ Params: { number: string; file: string } }>('/share/:number/:file', async (req, reply) => {
-    const number = Number(req.params.number);
+  app.get<{ Params: { file: string } }>('/share/:file', async (req, reply) => {
     const isPng = req.params.file.endsWith('.png');
-    const userId = req.params.file.replace(/\.png$/, '');
-    const data = await shareData(number, userId);
-    const target = `/?ref=share&d=${encodeURIComponent(req.params.number)}`;
-    if (!data) return isPng ? reply.status(404).send({ error: 'not_found' }) : reply.redirect(target);
+    const data = await sharedGame(req.params.file.replace(/\.png$/, ''));
+    const target = data?.c ? `/challenge/${data.c.token}?ref=share` : '/?ref=share';
+    if (!data) return isPng ? reply.status(404).send({ error: 'not_found' }) : reply.redirect('/');
     if (isPng) {
-      const png = await shareCardPng({ number, total: data.summary.total, rounds: data.summary.rounds });
+      const png = await shareCardPng({ title: data.title, subtitle: `${data.u.displayName} scored`, total: data.g.totalScore, scores: data.scores });
       return reply.header('content-type', 'image/png').header('cache-control', 'public, max-age=300').send(png);
     }
-    const title = `Earthnow #${number} · ${data.summary.total.toLocaleString('en-US')} / 25,000`;
-    const image = `${config.publicOrigin}/share/${number}/${userId}.png`;
+    const esc = (s: string) => s.replace(/[&<>"']/g, (ch) => `&#${ch.charCodeAt(0)};`);
+    const title = esc(`${data.title} · ${data.g.totalScore.toLocaleString('en-US')}`);
+    const image = `${config.publicOrigin}/share/${data.g.id}.png`;
     const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <title>${title}</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta property="og:title" content="${title}">
-<meta property="og:description" content="Five things happening on Earth right now. Where are they?">
+<meta property="og:description" content="Five places on Earth. Can you beat it?">
 <meta property="og:image" content="${image}">
-<meta property="og:image:width" content="1080"><meta property="og:image:height" content="1350">
-<meta property="og:type" content="website">
+<meta property="og:image:width" content="1200"><meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
 <meta http-equiv="refresh" content="0; url=${target}">
-</head><body><a href="${target}">Play today's Earthnow</a></body></html>`;
+</head><body><a href="${target}">Play on Earthnow</a></body></html>`;
     return reply.header('content-type', 'text/html; charset=utf-8').send(html);
   });
 
-  /* -------------------------------- admin --------------------------------- */
+  /* -------------------------------- admin -------------------------------- */
 
   function admin(req: FastifyRequest, reply: FastifyReply): boolean {
     const header = req.headers.authorization ?? '';
     const token = header.startsWith('Bearer ') ? header.slice(7) : '';
     const expected = config.adminToken;
-    const ok =
-      !!expected &&
-      token.length === expected.length &&
-      timingSafeEqual(Buffer.from(token), Buffer.from(expected));
+    const ok = !!expected && token.length === expected.length && timingSafeEqual(Buffer.from(token), Buffer.from(expected));
     if (!ok) void reply.status(401).send({ error: 'admin_only' });
     return ok;
   }
 
-  app.get<{ Params: { date: string } }>('/api/admin/daily/:date', async (req, reply) => {
+  app.post<{ Params: { id: string }; Body: { disabled?: boolean } }>('/api/admin/locations/:id/disable', async (req, reply) => {
     if (!admin(req, reply)) return reply;
-    if (!DATE.test(req.params.date)) throw new GameError(400, 'invalid_date');
-    const found = await game.dailyFor(req.params.date);
-    if (!found) return { date: req.params.date, published: isPublished(req.params.date, now()), daily: null, rounds: [] };
-    return {
-      date: req.params.date,
-      published: isPublished(req.params.date, now()),
-      daily: found.daily,
-      rounds: found.snapshots,
-    };
+    const [row] = await db
+      .update(locations)
+      .set({ disabled: req.body?.disabled !== false })
+      .where(eq(locations.id, uuidParam(req.params.id)))
+      .returning({ id: locations.id, disabled: locations.disabled });
+    if (!row) throw new GameError(404, 'location_not_found');
+    return row;
   });
-
-  app.post<{ Params: { date: string } }>('/api/admin/daily/:date/generate', async (req, reply) => {
-    if (!admin(req, reply)) return reply;
-    if (!DATE.test(req.params.date)) throw new GameError(400, 'invalid_date');
-    const fresh = process.env.LIVE_DATA === '1' ? 36 : 24 * 30;
-    return generateDaily(db, req.params.date, { now: now(), freshHours: fresh });
-  });
-
-  app.post<{ Params: { date: string }; Body: { index?: number; snapshotId?: string } }>(
-    '/api/admin/daily/:date/swap',
-    async (req, reply) => {
-      if (!admin(req, reply)) return reply;
-      const { date } = req.params;
-      const { index, snapshotId } = req.body ?? {};
-      if (!DATE.test(date) || !Number.isInteger(index) || typeof snapshotId !== 'string' || !UUID.test(snapshotId))
-        throw new GameError(400, 'invalid_request');
-      if (isPublished(date, now())) throw new DailyLockedError(date);
-      const [d] = await db.select().from(dailies).where(eq(dailies.date, date));
-      if (!d || index! < 0 || index! >= d.snapshotIds.length) throw new GameError(404, 'daily_not_found');
-      if (d.snapshotIds.includes(snapshotId)) throw new GameError(409, 'already_in_daily');
-      const [s] = await db.select().from(snapshots).where(eq(snapshots.id, snapshotId));
-      if (!s) throw new GameError(404, 'snapshot_not_found');
-      const ids = [...d.snapshotIds];
-      ids[index!] = snapshotId;
-      const [row] = await db.update(dailies).set({ snapshotIds: ids }).where(eq(dailies.id, d.id)).returning();
-      return row;
-    },
-  );
-
-  app.get<{ Querystring: { type?: string; limit?: string } }>('/api/admin/snapshots', async (req, reply) => {
-    if (!admin(req, reply)) return reply;
-    const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 50)));
-    const type = req.query.type as RoundType | undefined;
-    const where = type ? and(eq(snapshots.type, type), eq(snapshots.disabled, false)) : eq(snapshots.disabled, false);
-    return db.select().from(snapshots).where(where).orderBy(desc(snapshots.capturedAt)).limit(limit);
-  });
-
-  /** Remove a round's snapshot from play at once (e.g. an event turned deadly). */
-  app.post<{ Params: { id: string }; Body: { disabled?: boolean } }>('/api/admin/snapshots/:id/disable', async (req, reply) => {
-    if (!admin(req, reply)) return reply;
-    if (!UUID.test(req.params.id)) throw new GameError(400, 'invalid_request');
-    const disabled = req.body?.disabled !== false;
-    const [row] = await db.update(snapshots).set({ disabled }).where(eq(snapshots.id, req.params.id)).returning({ id: snapshots.id, disabled: snapshots.disabled });
-    if (!row) throw new GameError(404, 'snapshot_not_found');
-    // Replace it in today's and future dailies with a fresh snapshot of the same type,
-    // even though today's daily is otherwise locked. Scores already earned stay.
-    const replaced: string[] = [];
-    if (disabled) {
-      const affected = await db.select().from(dailies).where(and(gte(dailies.date, utcDate(now())), sql`${req.params.id}::uuid = ANY(${dailies.snapshotIds})`));
-      for (const d of affected) {
-        const [old] = await db.select().from(snapshots).where(eq(snapshots.id, req.params.id));
-        const used = rowsOf<{ id: string }>(await db.execute(sql`SELECT unnest(snapshot_ids)::text AS id FROM dailies`)).map((r) => r.id);
-        const candidates = await db.select().from(snapshots).where(and(eq(snapshots.type, old!.type), eq(snapshots.disabled, false))).orderBy(desc(snapshots.capturedAt)).limit(200);
-        const pick = candidates.find((c) => !used.includes(c.id));
-        if (!pick) continue;
-        await db.update(dailies).set({ snapshotIds: d.snapshotIds.map((id) => (id === req.params.id ? pick.id : id)) }).where(eq(dailies.id, d.id));
-        replaced.push(d.date);
-      }
-    }
-    return { ...row, replacedIn: replaced };
-  });
-
   app.post<{ Params: { id: string }; Body: { banned?: boolean } }>('/api/admin/users/:id/ban', async (req, reply) => {
     if (!admin(req, reply)) return reply;
-    if (!UUID.test(req.params.id)) throw new GameError(400, 'invalid_request');
-    const banned = req.body?.banned !== false;
-    const [row] = await db.update(users).set({ banned }).where(eq(users.id, req.params.id)).returning({ id: users.id, banned: users.banned });
+    const [row] = await db
+      .update(users)
+      .set({ banned: req.body?.banned !== false })
+      .where(eq(users.id, uuidParam(req.params.id)))
+      .returning({ id: users.id, banned: users.banned });
     if (!row) throw new GameError(404, 'user_not_found');
     return row;
   });
 
-  return app;
+  return Object.assign(app, { hub, game });
 }

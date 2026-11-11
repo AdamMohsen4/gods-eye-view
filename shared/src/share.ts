@@ -1,23 +1,9 @@
-import type { RoundType } from './types.ts';
 import { scoreBand } from './scoring.ts';
 
-export const TYPE_EMOJI: Record<RoundType, string> = {
-  flight: '✈️',
-  satellite: '🛰️',
-  fire: '🔥',
-  quake: '🌋',
-};
+const BAND_EMOJI = { great: '🟩', good: '🟨', fair: '🟧', poor: '🟥' } as const;
 
-const BAND_EMOJI = { green: '🟩', yellow: '🟨', red: '🟥' } as const;
-
-export interface ShareRound {
-  type: RoundType;
-  score: number;
-}
-
-/** Spoiler-free share text. One emoji row per round. */
-export function buildShareText(dailyNumber: number, rounds: ShareRound[], link: string): string {
-  const total = rounds.reduce((s, r) => s + r.score, 0);
-  const rows = rounds.map((r) => `${TYPE_EMOJI[r.type]} ${BAND_EMOJI[scoreBand(r.score)]}`);
-  return [`Earthnow #${dailyNumber} · ${total.toLocaleString('en-US')} 🌍`, ...rows, link].join('\n');
+/** Spoiler-free share text for a 5-round game. */
+export function shareText(opts: { title: string; total: number; scores: number[]; url: string }): string {
+  const row = opts.scores.map((s) => BAND_EMOJI[scoreBand(s)]).join('');
+  return `${opts.title} · ${opts.total.toLocaleString('en-US')} / ${(opts.scores.length * 5000).toLocaleString('en-US')}\n${row}\n${opts.url}`;
 }

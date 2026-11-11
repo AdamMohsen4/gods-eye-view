@@ -22,15 +22,15 @@ export default defineConfig({
   ],
   webServer: [
     {
-      command: 'pnpm --filter ./server start:test',
+      command: 'MAP_STYLE=offline pnpm --filter ./server start:test',
       cwd: '..',
-      url: 'http://127.0.0.1:8787/api/attributions',
+      url: 'http://127.0.0.1:8787/api/health',
       reuseExistingServer: reuse,
       timeout: 120_000,
       stdout: 'pipe',
     },
     {
-      command: 'VITE_IMAGERY=offline pnpm exec vite --port 5173 --strictPort',
+      command: 'pnpm exec vite --port 5173 --strictPort',
       url: 'http://localhost:5173',
       reuseExistingServer: reuse,
       timeout: 60_000,

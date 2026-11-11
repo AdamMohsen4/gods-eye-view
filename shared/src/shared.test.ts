@@ -1,110 +1,50 @@
 import { describe, expect, it } from 'vitest';
-import {
-  MIN_DISPLACEMENT_KM,
-  ROUND_TYPES,
-  buildPose,
-  buildShareText,
-  cameraGeo,
-  dailyNumber,
-  destination,
-  ecefToGeodetic,
-  geodeticToEcef,
-  haversineKm,
-  isoWeek,
-  scoreRound,
-  subjectGeo,
-} from './index.ts';
-
-describe('geo', () => {
-  it('haversine matches known distance (Stockholm–Oslo ≈ 417 km)', () => {
-    expect(haversineKm({ lat: 59.3293, lon: 18.0686 }, { lat: 59.9139, lon: 10.7522 })).toBeCloseTo(417, -1);
-  });
-  it('destination is consistent with haversine', () => {
-    const p = destination({ lat: 10, lon: 170 }, 77, 1234);
-    expect(haversineKm({ lat: 10, lon: 170 }, p)).toBeCloseTo(1234, 3);
-    expect(p.lon).toBeLessThanOrEqual(180);
-  });
-  it('ECEF round-trips', () => {
-    const g = ecefToGeodetic(geodeticToEcef({ lat: -33.9, lon: 151.2 }, 11000));
-    expect(g.lat).toBeCloseTo(-33.9, 6);
-    expect(g.lon).toBeCloseTo(151.2, 6);
-    expect(g.heightM).toBeCloseTo(11000, 1);
-  });
-});
+import { dailyNumber, duelMultiplier, elo, haversineKm, levelFor, scoreGuess, seededRandom, shareText, spreadKm } from './index.ts';
 
 describe('scoring', () => {
-  it('perfect guess without clues is 5000', () => {
-    expect(scoreRound('flight', 0, 0)).toBe(5000);
+  it('gives 5000 inside 25 m and decays with distance', () => {
+    expect(scoreGuess(0.01, 18000)).toBe(5000);
+    expect(scoreGuess(0, 18000)).toBe(5000);
+    const a = scoreGuess(100, 18000);
+    const b = scoreGuess(1000, 18000);
+    expect(a).toBeGreaterThan(b);
+    expect(b).toBeGreaterThan(2500);
+    expect(scoreGuess(1000, 1500)).toBeLessThan(10);
+    expect(scoreGuess(null, 1000)).toBe(0);
   });
-  it('applies distance decay and clue penalty', () => {
-    expect(scoreRound('quake', 1000, 0)).toBe(Math.round(5000 * Math.exp(-1)));
-    expect(scoreRound('quake', 0, 3)).toBe(3500);
-    expect(scoreRound('quake', 0, 9)).toBe(3500);
+  it('levels up quadratically', () => {
+    expect(levelFor(0).level).toBe(1);
+    expect(levelFor(60).level).toBe(2);
+    expect(levelFor(239).level).toBe(2);
+    expect(levelFor(240).level).toBe(3);
   });
-  it('no guess scores 0', () => {
-    expect(scoreRound('fire', null, 0)).toBe(0);
+  it('escalates duel damage from round 4', () => {
+    expect([0, 1, 2, 3, 4].map(duelMultiplier)).toEqual([1, 1, 1, 1.5, 2]);
   });
-});
-
-describe('camera poses never pinpoint the truth', () => {
-  const truth = { lat: 52.1, lon: 4.9 };
-  for (const type of ROUND_TYPES) {
-    it(type, () => {
-      for (let i = 0; i < 500; i++) {
-        const alt = type === 'flight' ? 11000 : type === 'satellite' ? 420_000 : 0;
-        const pose = buildPose({ type, truth, altitudeM: alt, headingDeg: 45, seed: `s${i}` });
-        const cam = cameraGeo(pose.camera);
-        const sub = subjectGeo(pose.camera, pose.subject);
-        expect(haversineKm(truth, cam)).toBeGreaterThanOrEqual(MIN_DISPLACEMENT_KM);
-        expect(haversineKm(truth, sub)).toBeGreaterThanOrEqual(MIN_DISPLACEMENT_KM);
-        // The subject reconstructs to the anchor (within a few metres).
-        expect(haversineKm(pose.anchor, sub)).toBeLessThan(0.05);
-      }
-    });
-  }
-  it('is deterministic for a seed', () => {
-    const a = buildPose({ type: 'quake', truth, altitudeM: 0, seed: 'x' });
-    const b = buildPose({ type: 'quake', truth, altitudeM: 0, seed: 'x' });
-    expect(a).toEqual(b);
+  it('elo is zero-sum', () => {
+    const [a, b] = elo(1000, 1000, 1);
+    expect(a).toBe(1016);
+    expect(b).toBe(984);
   });
 });
 
-describe('share text', () => {
-  it('is spoiler-free and formatted', () => {
-    const text = buildShareText(
-      142,
-      [
-        { type: 'flight', score: 4800 },
-        { type: 'satellite', score: 2000 },
-        { type: 'fire', score: 100 },
-        { type: 'quake', score: 5000 },
-        { type: 'flight', score: 3600 },
-      ],
-      'https://earthnow.example/d/142',
-    );
-    expect(text.split('\n')[0]).toBe('Earthnow #142 · 15,500 🌍');
-    expect(text).toContain('✈️ 🟩');
-    expect(text).toContain('🔥 🟥');
-    expect(text).not.toMatch(/\d+\.\d+/);
+describe('geo + misc', () => {
+  it('measures Stockholm → Gothenburg ~ 398 km', () => {
+    expect(haversineKm({ lat: 59.3293, lon: 18.0686 }, { lat: 57.7089, lon: 11.9746 })).toBeCloseTo(398, -1);
   });
-});
-
-describe('dates', () => {
+  it('spread of a single point is 0', () => {
+    expect(spreadKm([{ lat: 1, lon: 1 }])).toBe(0);
+  });
   it('numbers dailies from the epoch', () => {
-    expect(dailyNumber('2026-11-01')).toBe(1);
-    expect(dailyNumber('2026-11-09')).toBe(9);
+    expect(dailyNumber('2026-11-10')).toBe(1);
+    expect(dailyNumber('2026-11-12')).toBe(3);
   });
-  it('iso week', () => {
-    expect(isoWeek('2026-11-09')).toBe('2026-W46');
-    expect(isoWeek('2027-01-01')).toBe('2026-W53');
+  it('seeded random is deterministic', () => {
+    expect(seededRandom('x')()).toBe(seededRandom('x')());
   });
-});
-
-import { sunElevationDeg } from './index.ts';
-describe('sun elevation', () => {
-  it('is high at noon on the equator at equinox and negative at midnight', () => {
-    expect(sunElevationDeg('2026-03-20T12:00:00Z', { lat: 0, lon: 0 })).toBeGreaterThan(80);
-    expect(sunElevationDeg('2026-03-20T00:00:00Z', { lat: 0, lon: 0 })).toBeLessThan(-80);
-    expect(sunElevationDeg('2026-06-21T12:00:00Z', { lat: 59.3, lon: 18 })).toBeGreaterThan(45);
+  it('share text has no locations', () => {
+    const t = shareText({ title: 'Earthnow Daily #3', total: 12000, scores: [5000, 4000, 2000, 1000, 0], url: 'https://x/y' });
+    expect(t).toContain('🟩🟨🟧🟥🟥');
+    expect(t).toContain('12,000 / 25,000');
   });
 });

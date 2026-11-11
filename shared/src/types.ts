@@ -1,154 +1,169 @@
-/** Round types shipped in the MVP. Ships are phase 2 and deliberately absent. */
-export const ROUND_TYPES = ['flight', 'quake', 'fire', 'satellite'] as const;
-export type RoundType = (typeof ROUND_TYPES)[number];
-
-export type Mode = 'daily' | 'arcade';
+/** Street-level imagery sources. `fixture` is a generated stand-in for dev and tests. */
+export const PROVIDERS = ['mapillary', 'google', 'fixture'] as const;
+export type Provider = (typeof PROVIDERS)[number];
 
 export interface LatLon {
   lat: number;
   lon: number;
 }
 
+/** How much the player may do inside the panorama. */
+export type MoveMode = 'move' | 'nomove' | 'nmpz';
+
+export interface GameSettings {
+  move: MoveMode;
+  /** Seconds per round; 0 = no limit. */
+  timeLimit: number;
+  rounds: number;
+}
+
+export const DEFAULT_SETTINGS: GameSettings = { move: 'move', timeLimit: 0, rounds: 5 };
+export const TIME_LIMITS = [0, 10, 30, 60, 120, 180, 300] as const;
+export const MOVE_MODES: MoveMode[] = ['move', 'nomove', 'nmpz'];
+
+export type GameMode = 'classic' | 'daily' | 'challenge' | 'streak';
+
 /**
- * Camera pose for the labelless view. Position is Earth-centred Earth-fixed
- * (metres) and is ALWAYS displaced from the true location (see camera.ts),
- * so it never pinpoints the answer.
+ * What the client needs to show a panorama. Deliberately no lat/lon: the
+ * true location only leaves the server inside a reveal.
  */
-export interface CameraPose {
-  /** ECEF position in metres. */
-  position: [number, number, number];
-  /** Radians, Cesium convention (heading clockwise from north, pitch negative = down). */
+export interface PanoRef {
+  provider: Provider;
+  panoId: string;
+  /** Initial camera heading, degrees clockwise from north. */
   heading: number;
-  pitch: number;
-  roll: number;
-  /** Vertical field of view in degrees. */
-  fov: number;
 }
 
-/**
- * The thing to draw in the scene, as an offset from the camera in the camera's
- * local east-north-up frame (metres). Never an absolute coordinate.
- */
-export interface SceneSubject {
-  kind: RoundType;
-  offsetEnu: [number, number, number];
-  /** Subject heading in degrees (aircraft/satellite track). */
-  headingDeg?: number;
-  /** Visual size hint: magnitude for quakes, FRP for fires. */
-  intensity?: number;
+export interface MapSummary {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  kind: 'official' | 'community';
+  creatorName: string | null;
+  locationCount: number;
+  scaleKm: number;
+  plays: number;
 }
 
-export type ClueKey =
-  | 'altitude'
-  | 'speed'
-  | 'heading'
-  | 'localTime'
-  | 'magnitude'
-  | 'depth'
-  | 'frp'
-  | 'inclination'
-  | 'hemisphere';
-
-export interface Clue {
-  key: ClueKey;
-  label: string;
-  value: string;
+export interface CountryRef {
+  code: string;
+  name: string;
 }
 
-/** Clue keys offered for each round type, in unlock order (max 3 used). */
-export const CLUE_ORDER: Record<RoundType, ClueKey[]> = {
-  flight: ['altitude', 'speed', 'localTime'],
-  quake: ['magnitude', 'depth', 'localTime'],
-  fire: ['frp', 'localTime', 'hemisphere'],
-  satellite: ['altitude', 'inclination', 'localTime'],
-};
-
-export const MAX_CLUES = 3;
-
-/** Data attribution line shown in every reveal. */
-export interface Attribution {
-  text: string;
-  url: string;
-  license?: string;
-}
-
-/** Fact card shown at reveal. Neutral wording; no tracking links. */
-export interface FactCard {
-  title: string;
-  subtitle: string;
-  lines: string[];
-  country: string | null;
-}
-
-/* ---------------------------- API payloads ---------------------------- */
-
-/** One round as seen BEFORE the guess. Contains no true lat/lon. */
-export interface PublicRound {
-  snapshotId: string;
-  type: RoundType;
-  /** Seconds between capture and when the data was frozen (for "captured X min ago"). */
-  capturedAt: string;
-  camera: CameraPose;
-  subject: SceneSubject;
-  /** Simulation time to light the scene (equals capture time). */
-  sceneTime: string;
-  cluesAvailable: number;
-}
-
-export interface DailyToday {
-  date: string;
-  number: number;
-  rounds: PublicRound[];
-  /** Progress for the requesting player, if any. */
-  played: Array<{ snapshotId: string; score: number; distanceKm: number | null } | null>;
-}
-
-export interface StartRoundResponse {
-  roundId: string;
-  startedAt: string;
-  /** Null in modes without a timer. */
-  deadline: string | null;
-  round: PublicRound;
-  cluesUsed: Clue[];
-}
-
-export interface ClueResponse {
-  clue: Clue;
-  cluesUsed: number;
-}
-
-export interface GuessResponse {
-  roundId: string;
+export interface RevealedRound {
+  index: number;
   truth: LatLon;
+  country: CountryRef | null;
   guess: LatLon | null;
+  guessCountry: CountryRef | null;
   distanceKm: number | null;
   score: number;
   timedOut: boolean;
-  fact: FactCard;
-  attribution: Attribution[];
-  /** Daily only: set when this guess completed the day's five rounds. */
-  dailyComplete?: { total: number; streak: StreakState };
+  /** Streak mode: was the country right. */
+  correct?: boolean;
+  credit: string | null;
+  panoId: string;
+  provider: Provider;
 }
 
-export interface StreakState {
-  current: number;
-  best: number;
-  freezeAvailable: boolean;
+export interface ActiveRound {
+  index: number;
+  pano: PanoRef;
+  startedAt: string;
+  /** ISO time the round closes, or null when untimed. */
+  deadline: string | null;
+}
+
+export interface GameState {
+  id: string;
+  mode: GameMode;
+  map: MapSummary;
+  settings: GameSettings;
+  status: 'active' | 'finished';
+  totalScore: number;
+  /** Streak mode: current streak length. */
+  streak: number;
+  /** Rounds already revealed, oldest first. */
+  rounds: RevealedRound[];
+  current: ActiveRound | null;
+  challengeToken: string | null;
+  dailyNumber: number | null;
+}
+
+export interface GuessResponse {
+  round: RevealedRound;
+  totalScore: number;
+  streak: number;
+  finished: boolean;
+}
+
+export interface ChallengeInfo {
+  token: string;
+  map: MapSummary;
+  settings: GameSettings;
+  creatorName: string | null;
+  plays: number;
+  /** Your game for this challenge, if you have started it. */
+  gameId: string | null;
+  finished: boolean;
+  dailyNumber: number | null;
+  date: string | null;
 }
 
 export interface LeaderboardRow {
   rank: number;
+  userId: string;
   displayName: string;
   country: string | null;
   score: number;
-  isYou: boolean;
+  /** Total distance in km, used as tie-breaker and detail. */
+  distanceKm: number | null;
+  gameId?: string;
+}
+
+export interface Level {
+  level: number;
+  xp: number;
+  /** XP at which this level started and the next begins. */
+  floor: number;
+  next: number;
 }
 
 export interface MeResponse {
   id: string;
   displayName: string;
   country: string | null;
-  plan: 'free' | 'plus';
-  streak: StreakState;
-  arcade: { usedToday: number; limit: number | null };
+  rating: number;
+  level: Level;
+  dailyStreak: { current: number; best: number; playedToday: boolean };
+}
+
+export interface ProfileStats {
+  gamesPlayed: number;
+  roundsPlayed: number;
+  averageScore: number;
+  bestGame: number;
+  perfectRounds: number;
+  bestStreak: number;
+  duels: { played: number; won: number; rating: number };
+  recent: { gameId: string; mode: GameMode; mapName: string; score: number; streak: number; finishedAt: string }[];
+  countries: { code: string; name: string; rounds: number; averageScore: number }[];
+}
+
+export interface PublicConfig {
+  provider: Provider;
+  mapillaryToken: string | null;
+  googleKey: string | null;
+  /** 'openfreemap' (vector tiles, keyless) or 'offline' (bundled country outlines). */
+  mapStyle: 'openfreemap' | 'offline';
+}
+
+export interface EditableMap {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  published: boolean;
+  locations: { id: string; lat: number; lon: number; country: string | null }[];
 }

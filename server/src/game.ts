@@ -1,40 +1,59 @@
 /**
- * Game logic over the database. The true location of a snapshot only leaves
- * this module through `guessRound` (after the guess is locked) and the admin
- * routes. `toPublicRound` is the single place a snapshot becomes client data.
+ * Solo games: classic, daily, challenge and country streak.
+ *
+ * The true location of a round only leaves this module inside a revealed
+ * round (after its guess is locked) or a finished game. `activeRound` is the
+ * single place a location becomes client data before the guess, and it
+ * carries only the panorama id and a heading.
  */
-import { and, desc, eq, gte, inArray, isNotNull, lte, notInArray, sql } from 'drizzle-orm';
+import { randomBytes } from 'node:crypto';
+import { and, asc, desc, eq, inArray, notInArray, sql } from 'drizzle-orm';
 import {
-  dailies,
-  rounds,
+  challenges,
+  gameRounds,
+  games,
+  locations,
+  maps,
   rowsOf,
-  snapshots,
-  streaks,
   users,
+  type ChallengeRow,
   type Db,
-  type RoundRow,
-  type SnapshotRow,
+  type GameRoundRow,
+  type GameRow,
+  type LocationRow,
+  type MapRow,
   type UserRow,
 } from '@earthnow/db';
 import {
-  MAX_CLUES,
+  DEFAULT_SETTINGS,
+  MOVE_MODES,
+  TIME_LIMITS,
+  addDays,
+  dailyNumber,
   haversineKm,
   isLatLon,
-  scoreRound,
+  levelFor,
+  scoreGuess,
+  shuffle,
+  seededRandom,
+  spreadKm,
   utcDate,
-  type ClueResponse,
-  type DailyToday,
-  type FactCard,
+  xpForRound,
+  type ActiveRound,
+  type ChallengeInfo,
+  type GameMode,
+  type GameSettings,
+  type GameState,
   type GuessResponse,
   type LatLon,
   type LeaderboardRow,
+  type MapSummary,
   type MeResponse,
-  type PublicRound,
-  type StartRoundResponse,
+  type ProfileStats,
+  type RevealedRound,
 } from '@earthnow/shared';
 import type { Config } from './config.ts';
-import { revealAttribution } from './attributions.ts';
-import { EMPTY_STREAK, completeDay, displayStreak, type StreakRecord } from './streak.ts';
+import { countryAt, countryName, countryRef } from './countries.ts';
 
 export class GameError extends Error {
   constructor(
@@ -46,16 +65,33 @@ export class GameError extends Error {
   }
 }
 
-export function toPublicRound(s: SnapshotRow): PublicRound {
-  return {
-    snapshotId: s.id,
-    type: s.type,
-    capturedAt: s.capturedAt.toISOString(),
-    camera: s.cameraPose,
-    subject: s.subject,
-    sceneTime: s.eventAt.toISOString(),
-    cluesAvailable: Math.min(MAX_CLUES, s.clues.length),
-  };
+const STREAK_MAX_ROUNDS = 1000;
+/** Daily settings rotate through the week so every day plays differently. */
+const DAILY_ROTATION: GameSettings[] = [
+  { move: 'move', timeLimit: 0, rounds: 5 },
+  { move: 'nomove', timeLimit: 120, rounds: 5 },
+  { move: 'move', timeLimit: 180, rounds: 5 },
+  { move: 'nmpz', timeLimit: 60, rounds: 5 },
+  { move: 'move', timeLimit: 0, rounds: 5 },
+  { move: 'nomove', timeLimit: 0, rounds: 5 },
+  { move: 'nmpz', timeLimit: 0, rounds: 5 },
+];
+
+export function dailySettings(date: string): GameSettings {
+  return DAILY_ROTATION[(((dailyNumber(date) - 1) % 7) + 7) % 7]!;
+}
+
+export function parseSettings(raw: unknown, mode: GameMode = 'classic'): GameSettings {
+  const r = (raw ?? {}) as Partial<GameSettings>;
+  const move = MOVE_MODES.includes(r.move as never) ? r.move! : DEFAULT_SETTINGS.move;
+  const timeLimit = TIME_LIMITS.includes(r.timeLimit as never) ? r.timeLimit! : DEFAULT_SETTINGS.timeLimit;
+  const rounds = mode === 'streak' ? STREAK_MAX_ROUNDS : 5;
+  return { move, timeLimit, rounds };
+}
+
+function token(n = 10): string {
+  const alphabet = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  return [...randomBytes(n)].map((b) => alphabet[b % alphabet.length]).join('');
 }
 
 export class Game {
@@ -75,23 +111,20 @@ export class Game {
     return (await this.db.select().from(users).where(eq(users.guestId, guestId)))[0]!;
   }
 
-  private async streakRecord(userId: string): Promise<StreakRecord> {
-    const [row] = await this.db.select().from(streaks).where(eq(streaks.userId, userId));
-    return row ?? EMPTY_STREAK;
+  async userById(id: string): Promise<UserRow | null> {
+    return (await this.db.select().from(users).where(eq(users.id, id)))[0] ?? null;
   }
 
-  async me(user: UserRow): Promise<MeResponse> {
+  me(user: UserRow): MeResponse {
     const today = utcDate(this.now());
+    const alive = user.lastDaily === today || user.lastDaily === addDays(today, -1);
     return {
       id: user.id,
       displayName: user.displayName,
       country: user.country,
-      plan: user.plan,
-      streak: displayStreak(await this.streakRecord(user.id), today),
-      arcade: {
-        usedToday: await this.arcadeUsedToday(user.id),
-        limit: user.plan === 'plus' ? null : this.config.arcadeFreeRoundsPerDay,
-      },
+      rating: user.rating,
+      level: levelFor(user.xp),
+      dailyStreak: { current: alive ? user.dailyStreak : 0, best: user.dailyBest, playedToday: user.lastDaily === today },
     };
   }
 
@@ -104,269 +137,470 @@ export class Game {
       set.displayName = name;
     }
     if (patch.country !== undefined) {
-      if (patch.country === null) set.country = null;
+      if (patch.country === null || patch.country === '') set.country = null;
       else if (typeof patch.country === 'string' && /^[A-Za-z]{2}$/.test(patch.country)) set.country = patch.country.toUpperCase();
       else throw new GameError(400, 'invalid_country');
     }
     if (Object.keys(set).length) await this.db.update(users).set(set).where(eq(users.id, user.id));
-    const [fresh] = await this.db.select().from(users).where(eq(users.id, user.id));
-    return this.me(fresh!);
+    return this.me((await this.userById(user.id))!);
   }
 
-  /** GDPR: delete everything tied to this player. */
+  /** GDPR: everything tied to the player goes (games, rounds and match rows cascade). */
   async deleteMe(user: UserRow): Promise<void> {
-    await this.db.delete(rounds).where(eq(rounds.userId, user.id));
-    await this.db.delete(streaks).where(eq(streaks.userId, user.id));
+    await this.db.update(maps).set({ creatorId: null }).where(eq(maps.creatorId, user.id));
     await this.db.delete(users).where(eq(users.id, user.id));
   }
 
-  /* ------------------------------- daily ------------------------------- */
+  /* -------------------------------- maps -------------------------------- */
 
-  async dailyFor(date: string) {
-    const [d] = await this.db.select().from(dailies).where(eq(dailies.date, date));
-    if (!d) return null;
-    const rows = await this.db.select().from(snapshots).where(inArray(snapshots.id, d.snapshotIds));
-    const byId = new Map(rows.map((r) => [r.id, r]));
-    return { daily: d, snapshots: d.snapshotIds.map((id) => byId.get(id)!).filter(Boolean) };
+  async mapBySlug(slug: string): Promise<MapRow> {
+    const [m] = await this.db.select().from(maps).where(eq(maps.slug, slug));
+    if (!m) throw new GameError(404, 'map_not_found');
+    return m;
   }
 
-  async today(user: UserRow | null): Promise<DailyToday> {
-    const date = utcDate(this.now());
-    const found = await this.dailyFor(date);
-    if (!found) throw new GameError(503, 'daily_not_ready');
-    const played = user
-      ? await this.db
-          .select()
-          .from(rounds)
-          .where(and(eq(rounds.userId, user.id), inArray(rounds.snapshotId, found.daily.snapshotIds)))
-      : [];
-    return {
-      date,
-      number: found.daily.number,
-      rounds: found.snapshots.map(toPublicRound),
-      played: found.snapshots.map((s) => {
-        const r = played.find((p) => p.snapshotId === s.id && p.guessedAt);
-        return r ? { snapshotId: s.id, score: r.score ?? 0, distanceKm: r.distanceKm } : null;
-      }),
-    };
+  async mapById(id: string): Promise<MapRow> {
+    const [m] = await this.db.select().from(maps).where(eq(maps.id, id));
+    if (!m) throw new GameError(404, 'map_not_found');
+    return m;
   }
 
-  /* ------------------------------- rounds ------------------------------ */
-
-  private async snapshot(id: string): Promise<SnapshotRow> {
-    const [s] = await this.db.select().from(snapshots).where(eq(snapshots.id, id));
-    if (!s) throw new GameError(404, 'snapshot_not_found');
-    return s;
+  /** Map size in km for scoring, from the spread of its locations. */
+  async scaleKm(mapId: string): Promise<number> {
+    const [r] = rowsOf<{ min_lat: number; max_lat: number; min_lon: number; max_lon: number }>(
+      await this.db.execute(sql`SELECT min(lat) AS min_lat, max(lat) AS max_lat, min(lon) AS min_lon, max(lon) AS max_lon
+        FROM locations WHERE map_id = ${mapId} AND provider = ${this.config.provider} AND NOT disabled`),
+    );
+    if (!r || r.min_lat == null) return 1000;
+    const km = spreadKm([
+      { lat: r.min_lat, lon: r.min_lon },
+      { lat: r.max_lat, lon: r.max_lon },
+    ]);
+    return Math.max(50, Math.min(18_000, km));
   }
 
-  private startResponse(r: RoundRow, s: SnapshotRow): StartRoundResponse {
-    return {
-      roundId: r.id,
-      startedAt: r.startedAt.toISOString(),
-      deadline: r.deadline?.toISOString() ?? null,
-      round: toPublicRound(s),
-      cluesUsed: s.clues.slice(0, r.cluesUsed),
-    };
-  }
-
-  async startDaily(user: UserRow, snapshotId: string): Promise<StartRoundResponse> {
-    const date = utcDate(this.now());
-    const found = await this.dailyFor(date);
-    if (!found || !found.daily.snapshotIds.includes(snapshotId)) throw new GameError(404, 'not_in_todays_daily');
-    const s = found.snapshots.find((x) => x.id === snapshotId)!;
-    const [existing] = await this.db
-      .select()
-      .from(rounds)
-      .where(and(eq(rounds.userId, user.id), eq(rounds.snapshotId, snapshotId)));
-    if (existing) {
-      if (existing.guessedAt) throw new GameError(409, 'already_played');
-      return this.startResponse(existing, s);
-    }
-    const startedAt = this.now();
-    const deadline = new Date(startedAt.getTime() + this.config.roundTimerSeconds * 1000);
-    const [r] = await this.db
-      .insert(rounds)
-      .values({ userId: user.id, snapshotId, mode: 'daily', dailyDate: date, startedAt, deadline })
-      .onConflictDoNothing()
-      .returning();
-    if (!r) return this.startDaily(user, snapshotId); // lost a race; return the winner's row
-    return this.startResponse(r, s);
-  }
-
-  private async arcadeUsedToday(userId: string): Promise<number> {
-    const dayStart = new Date(`${utcDate(this.now())}T00:00:00Z`);
-    const [row] = await this.db
-      .select({ n: sql<number>`count(*)::int` })
-      .from(rounds)
-      .where(and(eq(rounds.userId, userId), eq(rounds.mode, 'arcade'), gte(rounds.startedAt, dayStart)));
-    return Number(row?.n ?? 0);
-  }
-
-  /** Arcade: a snapshot at least 5 minutes old, preferring the 5–15 minute window. */
-  async nextArcade(user: UserRow): Promise<StartRoundResponse> {
-    if (user.plan !== 'plus') {
-      const used = await this.arcadeUsedToday(user.id);
-      if (used >= this.config.arcadeFreeRoundsPerDay)
-        throw new GameError(429, 'arcade_limit', { limit: this.config.arcadeFreeRoundsPerDay });
-    }
-    const now = this.now();
-    const minAge = new Date(now.getTime() - 5 * 60_000);
-    const freshest = new Date(now.getTime() - 15 * 60_000);
-    // Never serve a snapshot that is in today's or a future Daily.
-    const reserved = rowsOf<{ id: string }>(
-      await this.db.execute(sql`SELECT unnest(snapshot_ids)::text AS id FROM dailies WHERE date >= ${utcDate(now)}::date`),
-    ).map((r) => r.id);
-    const played = (await this.db.select({ id: rounds.snapshotId }).from(rounds).where(eq(rounds.userId, user.id))).map((r) => r.id);
-    const exclude = [...reserved, ...played];
-    const base = and(eq(snapshots.disabled, false), lte(snapshots.capturedAt, minAge), exclude.length ? notInArray(snapshots.id, exclude) : undefined);
-    let pool = await this.db
-      .select()
-      .from(snapshots)
-      .where(and(base, gte(snapshots.capturedAt, freshest)))
-      .limit(50);
-    if (!pool.length) pool = await this.db.select().from(snapshots).where(base).orderBy(desc(snapshots.capturedAt)).limit(50);
-    if (!pool.length) throw new GameError(503, 'arcade_empty');
-    const s = pool[Math.floor(Math.random() * pool.length)]!;
-    const [r] = await this.db
-      .insert(rounds)
-      .values({ userId: user.id, snapshotId: s.id, mode: 'arcade', startedAt: now, deadline: null })
-      .returning();
-    return this.startResponse(r!, s);
-  }
-
-  private async ownRound(user: UserRow, roundId: string): Promise<RoundRow> {
-    if (!/^[0-9a-f-]{36}$/i.test(roundId)) throw new GameError(404, 'round_not_found');
-    const [r] = await this.db.select().from(rounds).where(and(eq(rounds.id, roundId), eq(rounds.userId, user.id)));
-    if (!r) throw new GameError(404, 'round_not_found');
-    return r;
-  }
-
-  private expired(r: RoundRow): boolean {
-    return !!r.deadline && this.now().getTime() > r.deadline.getTime() + this.config.timerGraceSeconds * 1000;
-  }
-
-  async clue(user: UserRow, roundId: string): Promise<ClueResponse> {
-    const r = await this.ownRound(user, roundId);
-    if (r.guessedAt || this.expired(r)) throw new GameError(409, 'round_closed');
-    const s = await this.snapshot(r.snapshotId);
-    if (r.cluesUsed >= Math.min(MAX_CLUES, s.clues.length)) throw new GameError(409, 'no_more_clues');
-    const [updated] = await this.db
-      .update(rounds)
-      .set({ cluesUsed: sql`${rounds.cluesUsed} + 1` })
-      .where(and(eq(rounds.id, r.id), eq(rounds.cluesUsed, r.cluesUsed), sql`${rounds.guessedAt} IS NULL`))
-      .returning();
-    if (!updated) throw new GameError(409, 'round_closed');
-    return { clue: s.clues[r.cluesUsed]!, cluesUsed: updated.cluesUsed };
-  }
-
-  async guess(user: UserRow, roundId: string, guess: unknown): Promise<GuessResponse> {
-    const r = await this.ownRound(user, roundId);
-    if (r.guessedAt) throw new GameError(409, 'already_guessed');
-    if (guess !== null && !isLatLon(guess)) throw new GameError(400, 'invalid_guess');
-    const s = await this.snapshot(r.snapshotId);
-    const timedOut = this.expired(r);
-    const pin: LatLon | null = guess && !timedOut ? { lat: (guess as LatLon).lat, lon: (guess as LatLon).lon } : null;
-    const truth = { lat: s.trueLat, lon: s.trueLon };
-    const distanceKm = pin ? haversineKm(pin, truth) : null;
-    const score = scoreRound(s.type, distanceKm, r.cluesUsed);
-    const [locked] = await this.db
-      .update(rounds)
-      .set({
-        guessLat: pin?.lat ?? null,
-        guessLon: pin?.lon ?? null,
-        guessedAt: this.now(),
-        distanceKm,
-        score,
-        timedOut,
-      })
-      .where(and(eq(rounds.id, r.id), sql`${rounds.guessedAt} IS NULL`))
-      .returning();
-    if (!locked) throw new GameError(409, 'already_guessed');
-
-    const response: GuessResponse = {
-      roundId: r.id,
-      truth,
-      guess: pin,
-      distanceKm: distanceKm === null ? null : Math.round(distanceKm * 10) / 10,
-      score,
-      timedOut,
-      fact: this.factWithAge(s),
-      attribution: revealAttribution(s.type),
-    };
-    if (r.mode === 'daily' && r.dailyDate) {
-      const done = await this.completedDaily(user.id, r.dailyDate);
-      if (done) response.dailyComplete = done;
-    }
-    return response;
-  }
-
-  private factWithAge(s: SnapshotRow): FactCard {
-    const fact = (s.payload as { fact: FactCard }).fact;
-    const mins = Math.max(0, Math.round((this.now().getTime() - s.capturedAt.getTime()) / 60_000));
-    const age = mins < 90 ? `${mins} min` : mins < 48 * 60 ? `${Math.round(mins / 60)} h` : `${Math.round(mins / 1440)} days`;
-    const lines = [...fact.lines];
-    if (s.type === 'flight' || s.type === 'satellite') lines[lines.length - 1] = `Captured ${age} ago`;
-    return { ...fact, lines };
-  }
-
-  /** If all five daily rounds are guessed, update the streak once and return totals. */
-  private async completedDaily(userId: string, date: string) {
-    const found = await this.dailyFor(date);
-    if (!found) return null;
-    const mine = await this.db
-      .select()
-      .from(rounds)
-      .where(and(eq(rounds.userId, userId), inArray(rounds.snapshotId, found.daily.snapshotIds), isNotNull(rounds.guessedAt)));
-    if (mine.length < found.daily.snapshotIds.length) return null;
-    const next = completeDay(await this.streakRecord(userId), date);
-    await this.db
-      .insert(streaks)
-      .values({ userId, ...next })
-      .onConflictDoUpdate({ target: streaks.userId, set: next });
-    return {
-      total: mine.reduce((sum, x) => sum + (x.score ?? 0), 0),
-      streak: { current: next.current, best: next.best, freezeAvailable: next.freezeAvailable },
-    };
-  }
-
-  async summary(user: UserRow, date: string) {
-    const found = await this.dailyFor(date);
-    if (!found) throw new GameError(404, 'daily_not_found');
-    const mine = await this.db
-      .select()
-      .from(rounds)
-      .where(and(eq(rounds.userId, user.id), inArray(rounds.snapshotId, found.daily.snapshotIds)));
-    const list = found.snapshots.map((s) => {
-      const r = mine.find((m) => m.snapshotId === s.id && m.guessedAt);
+  async summarize(rows: MapRow[]): Promise<MapSummary[]> {
+    if (!rows.length) return [];
+    const ids = rows.map((r) => r.id);
+    const counts = rowsOf<{ map_id: string; n: number; min_lat: number; max_lat: number; min_lon: number; max_lon: number }>(
+      await this.db.execute(sql`SELECT map_id, count(*)::int AS n, min(lat) AS min_lat, max(lat) AS max_lat, min(lon) AS min_lon, max(lon) AS max_lon
+        FROM locations WHERE provider = ${this.config.provider} AND NOT disabled
+        AND map_id IN (${sql.join(ids.map((i) => sql`${i}::uuid`), sql`, `)}) GROUP BY map_id`),
+    );
+    const plays = rowsOf<{ map_id: string; n: number }>(
+      await this.db.execute(sql`SELECT map_id, count(*)::int AS n FROM games
+        WHERE map_id IN (${sql.join(ids.map((i) => sql`${i}::uuid`), sql`, `)}) GROUP BY map_id`),
+    );
+    const creatorIds = [...new Set(rows.map((r) => r.creatorId).filter((x): x is string => !!x))];
+    const creators = creatorIds.length ? await this.db.select({ id: users.id, name: users.displayName }).from(users).where(inArray(users.id, creatorIds)) : [];
+    return rows.map((m) => {
+      const c = counts.find((x) => x.map_id === m.id);
+      const scale = c && c.n > 1 ? spreadKm([{ lat: c.min_lat, lon: c.min_lon }, { lat: c.max_lat, lon: c.max_lon }]) : 1000;
       return {
-        type: s.type,
-        score: r?.score ?? null,
-        guess: r && r.guessLat !== null && r.guessLon !== null ? { lat: r.guessLat, lon: r.guessLon } : null,
+        id: m.id,
+        slug: m.slug,
+        name: m.name,
+        description: m.description,
+        kind: m.kind,
+        creatorName: creators.find((x) => x.id === m.creatorId)?.name ?? null,
+        locationCount: c?.n ?? 0,
+        scaleKm: Math.round(Math.max(50, Math.min(18_000, scale))),
+        plays: plays.find((x) => x.map_id === m.id)?.n ?? 0,
       };
     });
-    return { date, number: found.daily.number, total: list.reduce((a, b) => a + (b.score ?? 0), 0), rounds: list };
   }
 
-  /* ---------------------------- leaderboard ---------------------------- */
+  async listMaps(kind?: 'official' | 'community'): Promise<MapSummary[]> {
+    const where = kind ? and(eq(maps.published, true), eq(maps.kind, kind)) : eq(maps.published, true);
+    const rows = await this.db.select().from(maps).where(where).orderBy(asc(maps.sort), desc(maps.createdAt)).limit(200);
+    return (await this.summarize(rows)).filter((m) => m.locationCount >= 5);
+  }
 
-  async leaderboard(user: UserRow | null, scope: 'global' | 'country', date: string) {
-    const country = scope === 'country' ? user?.country ?? null : null;
-    if (scope === 'country' && !country) return { date, scope, rows: [] as LeaderboardRow[], you: null };
-    const totals = rowsOf<{ id: string; display_name: string; country: string | null; score: number }>(
-      await this.db.execute(sql`
-        SELECT u.id, u.display_name, u.country, SUM(r.score)::int AS score
-        FROM rounds r JOIN users u ON u.id = r.user_id
-        WHERE r.mode = 'daily' AND r.daily_date = ${date}::date AND r.score IS NOT NULL AND NOT u.banned
-          ${country ? sql`AND u.country = ${country}` : sql``}
-        GROUP BY u.id ORDER BY score DESC, MIN(r.guessed_at) ASC`),
+  async mapSummary(row: MapRow): Promise<MapSummary> {
+    return (await this.summarize([row]))[0]!;
+  }
+
+  /* ------------------------------- rounds ------------------------------- */
+
+  private activeRound(r: GameRoundRow, loc: LocationRow): ActiveRound {
+    return {
+      index: r.idx,
+      pano: { provider: loc.provider, panoId: loc.panoId, heading: loc.heading },
+      startedAt: r.startedAt.toISOString(),
+      deadline: r.deadline ? r.deadline.toISOString() : null,
+    };
+  }
+
+  private revealed(g: GameRow, r: GameRoundRow, loc: LocationRow): RevealedRound {
+    const guess = r.guessLat != null && r.guessLon != null ? { lat: r.guessLat, lon: r.guessLon } : null;
+    return {
+      index: r.idx,
+      truth: { lat: loc.lat, lon: loc.lon },
+      country: countryRef(loc.country),
+      guess,
+      guessCountry: countryRef(r.guessCountry),
+      distanceKm: r.distanceKm,
+      score: r.score ?? 0,
+      timedOut: r.timedOut,
+      correct: g.mode === 'streak' ? !!loc.country && r.guessCountry === loc.country : undefined,
+      credit: loc.credit,
+      panoId: loc.panoId,
+      provider: loc.provider,
+    };
+  }
+
+  private async loadGame(user: UserRow, gameId: string): Promise<GameRow> {
+    const [g] = await this.db.select().from(games).where(eq(games.id, gameId));
+    if (!g || g.userId !== user.id) throw new GameError(404, 'game_not_found');
+    return g;
+  }
+
+  async state(user: UserRow, gameId: string): Promise<GameState> {
+    return this.stateOf(await this.loadGame(user, gameId));
+  }
+
+  private async stateOf(g: GameRow): Promise<GameState> {
+    const rs = await this.db.select().from(gameRounds).where(eq(gameRounds.gameId, g.id)).orderBy(asc(gameRounds.idx));
+    const locs = rs.length ? await this.db.select().from(locations).where(inArray(locations.id, rs.map((r) => r.locationId))) : [];
+    const locOf = (r: GameRoundRow) => locs.find((l) => l.id === r.locationId)!;
+    const done = rs.filter((r) => r.guessedAt);
+    const open = rs.find((r) => !r.guessedAt);
+    const map = await this.mapSummary(await this.mapById(g.mapId));
+    let challengeToken: string | null = null;
+    let number: number | null = null;
+    if (g.challengeId) {
+      const [c] = await this.db.select().from(challenges).where(eq(challenges.id, g.challengeId));
+      challengeToken = c?.token ?? null;
+      number = c?.dailyDate ? dailyNumber(c.dailyDate) : null;
+    }
+    return {
+      id: g.id,
+      mode: g.mode,
+      map: { ...map, scaleKm: Math.round(g.scaleKm) },
+      settings: g.settings,
+      status: g.status,
+      totalScore: g.totalScore,
+      streak: g.streak,
+      rounds: done.map((r) => this.revealed(g, r, locOf(r))),
+      current: open && g.status === 'active' ? this.activeRound(open, locOf(open)) : null,
+      challengeToken,
+      dailyNumber: number,
+    };
+  }
+
+  /** Pick a location for round `idx` of a game that has no fixed list. */
+  private async pickLocation(g: GameRow, used: string[]): Promise<LocationRow> {
+    const recent = rowsOf<{ location_id: string }>(
+      await this.db.execute(sql`SELECT gr.location_id FROM game_rounds gr JOIN games g ON g.id = gr.game_id
+        WHERE g.user_id = ${g.userId} AND g.map_id = ${g.mapId} ORDER BY gr.started_at DESC LIMIT 300`),
+    ).map((r) => r.location_id);
+    const base = and(eq(locations.mapId, g.mapId), eq(locations.provider, g.provider), eq(locations.disabled, false));
+    for (const avoid of [[...new Set([...used, ...recent])], used]) {
+      const where = avoid.length ? and(base, notInArray(locations.id, avoid)) : base;
+      const [loc] = await this.db.select().from(locations).where(where).orderBy(sql`random()`).limit(1);
+      if (loc) return loc;
+    }
+    throw new GameError(409, 'map_exhausted');
+  }
+
+  private async openRound(g: GameRow, idx: number, locationId: string): Promise<void> {
+    const started = this.now();
+    const deadline = g.settings.timeLimit ? new Date(started.getTime() + g.settings.timeLimit * 1000) : null;
+    await this.db.insert(gameRounds).values({ gameId: g.id, idx, locationId, startedAt: started, deadline }).onConflictDoNothing();
+  }
+
+  private async createGame(user: UserRow, map: MapRow, mode: GameMode, settings: GameSettings, challenge?: ChallengeRow): Promise<GameRow> {
+    const scale = await this.scaleKm(map.id);
+    const [g] = await this.db
+      .insert(games)
+      .values({ userId: user.id, mapId: map.id, mode, settings, challengeId: challenge?.id ?? null, provider: this.config.provider, scaleKm: scale })
+      .returning();
+    const first = challenge ? challenge.locationIds[0]! : (await this.pickLocation(g!, [])).id;
+    await this.openRound(g!, 0, first);
+    return g!;
+  }
+
+  async startGame(user: UserRow, body: { mapSlug?: unknown; mode?: unknown; settings?: unknown }): Promise<GameState> {
+    const mode: GameMode = body.mode === 'streak' ? 'streak' : 'classic';
+    if (typeof body.mapSlug !== 'string') throw new GameError(400, 'invalid_map');
+    const map = await this.mapBySlug(body.mapSlug);
+    if (!map.published && map.creatorId !== user.id) throw new GameError(404, 'map_not_found');
+    const settings = parseSettings(body.settings, mode);
+    const g = await this.createGame(user, map, mode, settings);
+    return this.stateOf(g);
+  }
+
+  async guess(user: UserRow, gameId: string, raw: unknown): Promise<GuessResponse> {
+    const g = await this.loadGame(user, gameId);
+    if (g.status !== 'active') throw new GameError(409, 'game_finished');
+    const [r] = await this.db.select().from(gameRounds).where(and(eq(gameRounds.gameId, g.id), sql`guessed_at IS NULL`));
+    if (!r) throw new GameError(409, 'no_open_round');
+    const [loc] = await this.db.select().from(locations).where(eq(locations.id, r.locationId));
+    const now = this.now();
+    const late = !!r.deadline && now.getTime() > r.deadline.getTime() + this.config.timerGraceSeconds * 1000;
+    const guess: LatLon | null = !late && isLatLon(raw) ? { lat: raw.lat, lon: raw.lon } : null;
+    if (raw !== null && raw !== undefined && !isLatLon(raw) && !late) throw new GameError(400, 'invalid_guess');
+    const distanceKm = guess ? haversineKm(guess, loc!) : null;
+    const guessCountry = guess ? countryAt(guess) : null;
+
+    let score = 0;
+    let streak = g.streak;
+    let finished = false;
+    if (g.mode === 'streak') {
+      const correct = !!guessCountry && guessCountry === loc!.country;
+      if (correct) streak++;
+      finished = !correct || r.idx + 1 >= STREAK_MAX_ROUNDS;
+    } else {
+      score = scoreGuess(distanceKm, g.scaleKm);
+      finished = r.idx + 1 >= g.settings.rounds;
+    }
+
+    const [updated] = await this.db
+      .update(gameRounds)
+      .set({ guessLat: guess?.lat ?? null, guessLon: guess?.lon ?? null, guessCountry, guessedAt: now, distanceKm, score, timedOut: !guess })
+      .where(and(eq(gameRounds.gameId, g.id), eq(gameRounds.idx, r.idx), sql`guessed_at IS NULL`))
+      .returning();
+    if (!updated) throw new GameError(409, 'already_guessed');
+
+    const totalScore = g.totalScore + score;
+    await this.db
+      .update(games)
+      .set({
+        totalScore,
+        totalDistanceKm: g.totalDistanceKm + (distanceKm ?? 20_000),
+        streak,
+        status: finished ? 'finished' : 'active',
+        finishedAt: finished ? now : null,
+      })
+      .where(eq(games.id, g.id));
+    const xp = g.mode === 'streak' ? (streak > g.streak ? 10 : 0) : xpForRound(score);
+    if (xp) await this.db.update(users).set({ xp: sql`${users.xp} + ${xp}` }).where(eq(users.id, user.id));
+    if (finished && g.challengeId) await this.afterChallenge(user, g.challengeId);
+
+    const round = this.revealed({ ...g, streak }, updated, loc!);
+    return { round, totalScore, streak, finished };
+  }
+
+  async next(user: UserRow, gameId: string): Promise<GameState> {
+    const g = await this.loadGame(user, gameId);
+    if (g.status !== 'active') throw new GameError(409, 'game_finished');
+    const rs = await this.db.select().from(gameRounds).where(eq(gameRounds.gameId, g.id)).orderBy(asc(gameRounds.idx));
+    if (rs.some((r) => !r.guessedAt)) return this.stateOf(g);
+    const idx = rs.length;
+    let locationId: string;
+    if (g.challengeId) {
+      const [c] = await this.db.select().from(challenges).where(eq(challenges.id, g.challengeId));
+      locationId = c!.locationIds[idx]!;
+    } else {
+      locationId = (await this.pickLocation(g, rs.map((r) => r.locationId))).id;
+    }
+    await this.openRound(g, idx, locationId);
+    return this.stateOf(g);
+  }
+
+  /* ----------------------------- challenges ----------------------------- */
+
+  async createChallenge(user: UserRow, body: { mapSlug?: unknown; settings?: unknown }): Promise<{ token: string }> {
+    if (typeof body.mapSlug !== 'string') throw new GameError(400, 'invalid_map');
+    const map = await this.mapBySlug(body.mapSlug);
+    if (!map.published) throw new GameError(404, 'map_not_found');
+    const settings = parseSettings(body.settings);
+    const picks = await this.db
+      .select({ id: locations.id })
+      .from(locations)
+      .where(and(eq(locations.mapId, map.id), eq(locations.provider, this.config.provider), eq(locations.disabled, false)))
+      .orderBy(sql`random()`)
+      .limit(settings.rounds);
+    if (picks.length < settings.rounds) throw new GameError(409, 'map_too_small');
+    const t = token();
+    await this.db.insert(challenges).values({ token: t, mapId: map.id, settings, locationIds: picks.map((p) => p.id), creatorId: user.id });
+    return { token: t };
+  }
+
+  private async challengeByToken(t: string): Promise<ChallengeRow> {
+    const [c] = await this.db.select().from(challenges).where(eq(challenges.token, t));
+    if (!c) throw new GameError(404, 'challenge_not_found');
+    return c;
+  }
+
+  async challengeInfo(user: UserRow | null, t: string): Promise<ChallengeInfo> {
+    return this.infoOf(user, await this.challengeByToken(t));
+  }
+
+  private async infoOf(user: UserRow | null, c: ChallengeRow): Promise<ChallengeInfo> {
+    const map = await this.mapSummary(await this.mapById(c.mapId));
+    const creator = c.creatorId ? await this.userById(c.creatorId) : null;
+    const [p] = rowsOf<{ n: number }>(await this.db.execute(sql`SELECT count(*)::int AS n FROM games WHERE challenge_id = ${c.id} AND status = 'finished'`));
+    const mine = user ? (await this.db.select().from(games).where(and(eq(games.userId, user.id), eq(games.challengeId, c.id))))[0] : undefined;
+    return {
+      token: c.token,
+      map,
+      settings: c.settings,
+      creatorName: creator?.displayName ?? null,
+      plays: p?.n ?? 0,
+      gameId: mine?.id ?? null,
+      finished: mine?.status === 'finished',
+      dailyNumber: c.dailyDate ? dailyNumber(c.dailyDate) : null,
+      date: c.dailyDate,
+    };
+  }
+
+  /** Start (or resume) your game for a challenge. One attempt per player. */
+  async playChallenge(user: UserRow, t: string): Promise<GameState> {
+    const c = await this.challengeByToken(t);
+    if (c.dailyDate && c.dailyDate !== utcDate(this.now())) {
+      const mine = (await this.db.select().from(games).where(and(eq(games.userId, user.id), eq(games.challengeId, c.id))))[0];
+      if (!mine) throw new GameError(409, 'daily_closed');
+    }
+    const existing = (await this.db.select().from(games).where(and(eq(games.userId, user.id), eq(games.challengeId, c.id))))[0];
+    if (existing) return this.stateOf(existing);
+    const map = await this.mapById(c.mapId);
+    // Challenges keep the provider they were made with; their location ids pin it.
+    const g = await this.createGame(user, map, c.dailyDate ? 'daily' : 'challenge', c.settings, c);
+    return this.stateOf(g);
+  }
+
+  private async afterChallenge(user: UserRow, challengeId: string): Promise<void> {
+    const [c] = await this.db.select().from(challenges).where(eq(challenges.id, challengeId));
+    if (!c?.dailyDate) return;
+    const fresh = (await this.userById(user.id))!;
+    if (fresh.lastDaily === c.dailyDate) return;
+    const current = fresh.lastDaily === addDays(c.dailyDate, -1) ? fresh.dailyStreak + 1 : 1;
+    await this.db
+      .update(users)
+      .set({ dailyStreak: current, dailyBest: Math.max(current, fresh.dailyBest), lastDaily: c.dailyDate })
+      .where(eq(users.id, user.id));
+  }
+
+  /* -------------------------------- daily ------------------------------- */
+
+  /** Today's daily challenge, created on first request. Same five places for everyone. */
+  async daily(date = utcDate(this.now())): Promise<ChallengeRow> {
+    const [existing] = await this.db.select().from(challenges).where(eq(challenges.dailyDate, date));
+    if (existing) return existing;
+    const world = await this.mapBySlug('world');
+    const settings = dailySettings(date);
+    const recent = rowsOf<{ id: string }>(
+      await this.db.execute(sql`SELECT unnest(location_ids)::text AS id FROM challenges WHERE daily_date IS NOT NULL AND daily_date > ${addDays(date, -120)}::date`),
+    ).map((r) => r.id);
+    const pool = await this.db
+      .select({ id: locations.id, country: locations.country })
+      .from(locations)
+      .where(and(eq(locations.mapId, world.id), eq(locations.provider, this.config.provider), eq(locations.disabled, false)))
+      .orderBy(asc(locations.id));
+    const rnd = seededRandom(`daily:${date}`);
+    const fresh = pool.filter((p) => !recent.includes(p.id));
+    // Five different countries where possible.
+    const picks: string[] = [];
+    const countriesUsed = new Set<string>();
+    for (const p of shuffle(fresh.length >= 5 ? fresh : pool, rnd)) {
+      if (picks.length >= settings.rounds) break;
+      if (p.country && countriesUsed.has(p.country)) continue;
+      picks.push(p.id);
+      if (p.country) countriesUsed.add(p.country);
+    }
+    if (picks.length < settings.rounds) throw new GameError(503, 'no_locations');
+    await this.db
+      .insert(challenges)
+      .values({ token: `daily-${date}`, mapId: world.id, settings, locationIds: picks, dailyDate: date })
+      .onConflictDoNothing();
+    return (await this.db.select().from(challenges).where(eq(challenges.dailyDate, date)))[0]!;
+  }
+
+  async dailyInfo(user: UserRow | null): Promise<ChallengeInfo> {
+    return this.infoOf(user, await this.daily());
+  }
+
+  /* ---------------------------- leaderboards ---------------------------- */
+
+  async challengeLeaderboard(user: UserRow | null, t: string): Promise<{ rows: LeaderboardRow[]; you: LeaderboardRow | null }> {
+    const c = await this.challengeByToken(t);
+    // Results are only shown to people who have finished, so the board can't spoil the rounds.
+    const all = rowsOf<{ id: string; user_id: string; display_name: string; country: string | null; total_score: number; total_distance_km: number }>(
+      await this.db.execute(sql`SELECT g.id, g.user_id, u.display_name, u.country, g.total_score, g.total_distance_km
+        FROM games g JOIN users u ON u.id = g.user_id
+        WHERE g.challenge_id = ${c.id} AND g.status = 'finished' AND NOT u.banned
+        ORDER BY g.total_score DESC, g.total_distance_km ASC, g.finished_at ASC LIMIT 1000`),
     );
-    const rows = totals.map((t, i) => ({
+    const rows = all.map((r, i) => ({
       rank: i + 1,
-      displayName: t.display_name,
-      country: t.country?.trim() ?? null,
-      score: t.score,
-      isYou: t.id === user?.id,
+      userId: r.user_id,
+      displayName: r.display_name,
+      country: r.country,
+      score: r.total_score,
+      distanceKm: Math.round(r.total_distance_km),
+      gameId: r.id,
     }));
-    return { date, scope, rows: rows.slice(0, 50), you: rows.find((r) => r.isYou) ?? null };
+    const you = user ? (rows.find((r) => r.userId === user.id) ?? null) : null;
+    return { rows: rows.slice(0, 100), you };
+  }
+
+  async mapLeaderboard(slug: string, mode: 'classic' | 'streak'): Promise<LeaderboardRow[]> {
+    const map = await this.mapBySlug(slug);
+    const metric = mode === 'streak' ? sql`max(g.streak)` : sql`max(g.total_score)`;
+    const rows = rowsOf<{ user_id: string; display_name: string; country: string | null; best: number }>(
+      await this.db.execute(sql`SELECT g.user_id, u.display_name, u.country, ${metric}::int AS best
+        FROM games g JOIN users u ON u.id = g.user_id
+        WHERE g.map_id = ${map.id} AND g.mode = ${mode === 'streak' ? 'streak' : 'classic'} AND g.status = 'finished' AND NOT u.banned
+        GROUP BY g.user_id, u.display_name, u.country ORDER BY best DESC LIMIT 50`),
+    );
+    return rows.map((r, i) => ({ rank: i + 1, userId: r.user_id, displayName: r.display_name, country: r.country, score: r.best, distanceKm: null }));
+  }
+
+  async ratingLeaderboard(): Promise<LeaderboardRow[]> {
+    const rows = rowsOf<{ id: string; display_name: string; country: string | null; rating: number }>(
+      await this.db.execute(sql`SELECT u.id, u.display_name, u.country, u.rating FROM users u
+        WHERE NOT u.banned AND EXISTS (SELECT 1 FROM match_players mp JOIN matches m ON m.id = mp.match_id WHERE mp.user_id = u.id AND m.ranked)
+        ORDER BY u.rating DESC LIMIT 100`),
+    );
+    return rows.map((r, i) => ({ rank: i + 1, userId: r.id, displayName: r.display_name, country: r.country, score: r.rating, distanceKm: null }));
+  }
+
+  /* -------------------------------- stats ------------------------------- */
+
+  async stats(user: UserRow): Promise<ProfileStats> {
+    const [agg] = rowsOf<{ games: number; best: number | null; best_streak: number | null }>(
+      await this.db.execute(sql`SELECT count(*)::int AS games,
+        max(total_score) FILTER (WHERE mode <> 'streak')::int AS best,
+        max(streak) FILTER (WHERE mode = 'streak')::int AS best_streak
+        FROM games WHERE user_id = ${user.id} AND status = 'finished'`),
+    );
+    const [rounds] = rowsOf<{ n: number; avg: number | null; perfect: number }>(
+      await this.db.execute(sql`SELECT count(*)::int AS n, avg(gr.score)::float AS avg, count(*) FILTER (WHERE gr.score = 5000)::int AS perfect
+        FROM game_rounds gr JOIN games g ON g.id = gr.game_id
+        WHERE g.user_id = ${user.id} AND gr.guessed_at IS NOT NULL AND g.mode <> 'streak'`),
+    );
+    const [duels] = rowsOf<{ played: number; won: number }>(
+      await this.db.execute(sql`SELECT count(*)::int AS played, count(*) FILTER (WHERE mp.won)::int AS won
+        FROM match_players mp JOIN matches m ON m.id = mp.match_id WHERE mp.user_id = ${user.id} AND m.format = 'duel'`),
+    );
+    const recent = rowsOf<{ id: string; mode: GameMode; name: string; total_score: number; streak: number; finished_at: Date | string }>(
+      await this.db.execute(sql`SELECT g.id, g.mode, m.name, g.total_score, g.streak, g.finished_at FROM games g JOIN maps m ON m.id = g.map_id
+        WHERE g.user_id = ${user.id} AND g.status = 'finished' ORDER BY g.finished_at DESC LIMIT 10`),
+    );
+    const byCountry = rowsOf<{ country: string; n: number; avg: number }>(
+      await this.db.execute(sql`SELECT l.country, count(*)::int AS n, avg(gr.score)::float AS avg
+        FROM game_rounds gr JOIN games g ON g.id = gr.game_id JOIN locations l ON l.id = gr.location_id
+        WHERE g.user_id = ${user.id} AND gr.guessed_at IS NOT NULL AND g.mode <> 'streak' AND l.country IS NOT NULL
+        GROUP BY l.country ORDER BY n DESC LIMIT 40`),
+    );
+    return {
+      gamesPlayed: agg?.games ?? 0,
+      roundsPlayed: rounds?.n ?? 0,
+      averageScore: Math.round(rounds?.avg ?? 0),
+      bestGame: agg?.best ?? 0,
+      perfectRounds: rounds?.perfect ?? 0,
+      bestStreak: agg?.best_streak ?? 0,
+      duels: { played: duels?.played ?? 0, won: duels?.won ?? 0, rating: user.rating },
+      recent: recent.map((r) => ({
+        gameId: r.id,
+        mode: r.mode,
+        mapName: r.name,
+        score: r.total_score,
+        streak: r.streak,
+        finishedAt: new Date(r.finished_at).toISOString(),
+      })),
+      countries: byCountry.map((c) => ({ code: c.country, name: countryName(c.country), rounds: c.n, averageScore: Math.round(c.avg) })),
+    };
   }
 }

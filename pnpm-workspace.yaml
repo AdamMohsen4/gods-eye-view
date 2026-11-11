@@ -1,7 +1,6 @@
 packages:
   - shared
   - db
-  - worker
   - server
   - client
 onlyBuiltDependencies:

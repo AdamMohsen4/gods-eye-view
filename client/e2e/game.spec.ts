@@ -1,125 +1,61 @@
-import { expect, test, type Page, type TestInfo } from '@playwright/test';
-import { mkdirSync } from 'node:fs';
+import { expect, test, type Browser, type Page } from '@playwright/test';
 
-const SHOTS = 'test-results/screenshots';
-mkdirSync(SHOTS, { recursive: true });
-
-async function shot(page: Page, info: TestInfo, name: string) {
-  await page.waitForTimeout(450); // let the page fade-in finish
-  await page.screenshot({ path: `${SHOTS}/${info.project.name}-${name}.png` });
-}
-
-async function placePin(page: Page, fx = 0.55, fy = 0.45) {
-  const toggle = page.locator('.sheet-toggle');
-  if (await toggle.isVisible()) {
-    await toggle.click();
-    await page.waitForTimeout(400); // sheet height transition
-  }
+async function pin(page: Page, fx = 0.5, fy = 0.4) {
+  const mobile = (page.viewportSize()?.width ?? 1000) < 820;
+  if (mobile) await page.getByTestId('open-map').click();
   const map = page.getByTestId('guess-map');
-  await expect(map.locator('svg path.gm-land')).toHaveAttribute('d', /M/);
+  await expect(map.locator('canvas')).toBeVisible();
   const box = (await map.boundingBox())!;
-  const position = { x: box.width * fx, y: box.height * fy };
-  if (test.info().project.name === 'mobile') await map.tap({ position });
-  else await page.mouse.click(box.x + position.x, box.y + position.y);
-  await expect(page.getByTestId('confirm')).toBeEnabled();
+  await page.mouse.click(box.x + box.width * fx, box.y + box.height * fy);
 }
 
-test('plays a full Daily Earth and shares the result', async ({ page }, info) => {
+test('classic game: five rounds to a summary', async ({ page }) => {
   await page.goto('/');
-  await expect(page.getByTestId('daily-card')).toBeVisible();
-  await shot(page, info, 'home');
-  await page.getByTestId('play-daily').click();
-
+  await page.getByTestId('play-world').click();
+  await expect(page).toHaveURL(/\/game\//);
   for (let i = 0; i < 5; i++) {
-    await expect(page.getByTestId('round-hud')).toBeVisible({ timeout: 60_000 });
-    await expect(page.locator('.loading-veil')).toHaveCount(0, { timeout: 30_000 });
-    await expect(page.getByTestId('timer')).toHaveText(/^\d:\d\d$/);
-    const type = await page.locator('.type-badge svg').getAttribute('aria-label');
-    await page.waitForTimeout(1500);
-    await shot(page, info, `round-${i + 1}-${type}`);
-    if (i === 0) {
-      await page.getByTestId('clue-btn').click();
-      await expect(page.getByTestId('clue')).toHaveCount(1);
-    }
-    await placePin(page, 0.3 + i * 0.1, 0.4);
-    if (i === 0) await shot(page, info, 'guess-map');
-    await page.getByTestId('confirm').click();
-    await expect(page.getByTestId('reveal')).toBeVisible({ timeout: 30_000 });
-    await expect(page.getByTestId('attribution')).toContainText(/\w/);
-    await expect(page.getByTestId('score')).toHaveText(/^[\d,]+$/);
-    if (i === 0) {
-      await page.waitForTimeout(800);
-      await shot(page, info, 'reveal');
-    }
-    await page.getByTestId('next').click();
+    await expect(page.locator('.pano[data-status="ready"]')).toBeVisible();
+    await pin(page);
+    await page.getByTestId('guess-button').click();
+    await expect(page.getByTestId('result-map')).toBeVisible();
+    await expect(page.locator('.reveal-card')).toContainText(i === 0 ? 'Round 1 of 5' : `Round ${i + 1} of 5`);
+    await page.getByTestId('next-button').click();
   }
-
-  await expect(page.getByTestId('results')).toBeVisible();
-  const share = await page.getByTestId('share-text').innerText();
-  const lines = share.trim().split('\n');
-  expect(lines[0]).toMatch(/^Earthnow #\d+ · [\d,]+ 🌍$/);
-  expect(lines.slice(1, 6)).toHaveLength(5);
-  for (const l of lines.slice(1, 6)) expect(l).toMatch(/^(✈️|🛰️|🔥|🌋) (🟩|🟨|🟥)$/u);
-  expect(lines[6]).toMatch(/\/share\/\d+\/[\w-]+$/);
-  await shot(page, info, 'results');
-
-  // Home now shows the finished Daily.
-  await page.goto('/');
-  await expect(page.getByTestId('see-results')).toBeVisible();
+  await expect(page.locator('.summary-card')).toContainText('/ 25,000');
+  await expect(page.locator('.round-list li')).toHaveCount(5);
 });
 
-test('plays one Live Arcade round', async ({ page }, info) => {
-  await page.goto('/');
-  await page.getByTestId('arcade-card').getByRole('button', { name: 'Play' }).click();
-  await expect(page.getByTestId('round-hud')).toBeVisible({ timeout: 60_000 });
-  await expect(page.getByTestId('timer')).toHaveCount(0);
-  await placePin(page);
-  await page.getByTestId('confirm').click();
-  await expect(page.getByTestId('reveal')).toBeVisible({ timeout: 30_000 });
-  await shot(page, info, 'arcade-reveal');
-});
-
-test('share link opens the Daily directly', async ({ page }) => {
-  await page.goto('/?ref=share&d=1');
-  await expect(page.getByTestId('round-hud')).toBeVisible({ timeout: 60_000 });
-});
-
-test('about page lists data attributions and the MIT notice', async ({ page }, info) => {
-  await page.goto('/#/about');
-  const list = page.getByTestId('attributions');
-  await expect(list.locator('li a').first()).toBeVisible();
-  await expect(page.getByTestId('about')).toContainText('Bilawal Sidhu');
-  await expect(page.getByTestId('about')).toContainText('CC BY 4.0');
-  await shot(page, info, 'about');
-});
-
-test('leaderboard renders', async ({ page }, info) => {
-  await page.goto('/#/leaderboard');
-  await expect(page.getByTestId('leaderboard')).toBeVisible();
-  await expect(page.locator('[data-lb] .empty, [data-lb] table')).toBeVisible();
-  await shot(page, info, 'leaderboard');
-});
-
-test('the 3D view can be dragged and zoomed during a round', async ({ page }, info) => {
-  test.skip(info.project.name !== 'desktop', 'mouse drag; touch is handled by Cesium natively');
-  await page.goto('/');
-  await page.getByTestId('arcade-card').getByRole('button', { name: 'Play' }).click();
-  await expect(page.getByTestId('round-hud')).toBeVisible({ timeout: 60_000 });
-  await expect(page.locator('.loading-veil')).toHaveCount(0, { timeout: 30_000 });
-  // The overlay must let pointer events through to the 3D view (regression: it swallowed them).
-  for (const [x, y] of [[400, 400], [200, 300], [640, 200]]) {
-    expect(await page.evaluate(([px, py]) => document.elementFromPoint(px!, py!)?.tagName, [x, y])).toBe('CANVAS');
+test('daily: plays and opens the leaderboard', async ({ page }) => {
+  await page.goto('/daily');
+  await page.getByTestId('play-challenge').click();
+  for (let i = 0; i < 5; i++) {
+    await pin(page, 0.3 + i * 0.1, 0.4);
+    await page.getByTestId('guess-button').click();
+    await page.getByTestId('next-button').click();
   }
-  // And Cesium's camera actually moves when dragged.
-  const height = () => page.evaluate(() => Number(document.body.dataset.cameraHeight));
-  await page.mouse.move(640, 400);
-  await page.mouse.down();
-  await page.mouse.move(600, 380, { steps: 4 });
-  await page.mouse.up();
-  await page.waitForTimeout(400);
-  const h0 = await height();
-  expect(Number.isFinite(h0)).toBe(true);
-  for (let k = 0; k < 5; k++) await page.mouse.wheel(0, -400);
-  await page.waitForTimeout(800);
-  expect(await height()).not.toBe(h0);
+  await expect(page.locator('.summary-card')).toContainText('Daily #');
+  await expect(page.locator('.board-list li').first()).toBeVisible();
+});
+
+test('party: two players finish a 3-round game', async ({ browser }, info) => {
+  test.skip(info.project.name !== 'desktop', 'multiplayer runs once');
+  const open = async (b: Browser) => (await b.newContext({ viewport: { width: 1280, height: 800 } })).newPage();
+  const host = await open(browser);
+  const guest = await open(browser);
+  await host.goto('/party');
+  await expect(host).toHaveURL(/\/party\/[A-Z0-9]{5}$/);
+  await guest.goto(host.url());
+  await expect(host.locator('.players li')).toHaveCount(2);
+  await host.getByRole('radio', { name: '3', exact: true }).click();
+  await host.getByTestId('start-party').click();
+  for (let i = 0; i < 3; i++) {
+    for (const p of [host, guest]) {
+      await expect(p.locator('.pano[data-status="ready"]')).toBeVisible({ timeout: 30_000 });
+      await pin(p, 0.4 + Math.random() * 0.2, 0.4);
+      await p.getByTestId('guess-button').click();
+    }
+    await expect(host.locator('.round-table, .final-list').first()).toBeVisible();
+  }
+  await expect(host.getByText(/You won|wins|A draw/)).toBeVisible({ timeout: 20_000 });
+  await expect(guest.getByText(/You won|wins|A draw/)).toBeVisible();
 });

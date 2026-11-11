@@ -2,19 +2,21 @@
   "name": "earthnow",
   "private": true,
   "version": "0.1.0",
-  "description": "Live-world guessing game. Fork of bilawalsidhu/gods-eye-view (MIT).",
+  "description": "Street-level geography guessing game.",
   "type": "module",
   "license": "SEE LICENSE IN LICENSE",
   "packageManager": "pnpm@10.18.0",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "pnpm -r --parallel --filter ./server --filter ./client run dev",
     "build": "pnpm -r run build",
     "lint": "eslint . && pnpm -r run typecheck",
     "test": "vitest run",
     "test:e2e": "pnpm --filter ./client run test:e2e",
-    "seed": "pnpm --filter ./worker run seed",
-    "fixtures:record": "LIVE_DATA=1 pnpm --filter ./worker run record"
+    "seed": "pnpm --filter ./server run seed",
+    "locations:generate": "pnpm --filter ./server run locations:generate"
   },
   "devDependencies": {
     "@eslint/js": "^9.17.0",

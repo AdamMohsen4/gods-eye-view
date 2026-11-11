@@ -1,97 +1,113 @@
 import type {
-  Attribution,
-  ClueResponse,
-  DailyToday,
+  ChallengeInfo,
+  EditableMap,
+  GameSettings,
+  GameState,
   GuessResponse,
   LatLon,
   LeaderboardRow,
+  MapSummary,
   MeResponse,
-  RoundType,
-  StartRoundResponse,
+  ProfileStats,
+  PublicConfig,
+  CountryRef,
 } from '@earthnow/shared';
-import { UUID_RE, uuidFromBytes } from './lib/format.ts';
 
 const KEY = 'earthnow.guestId';
-let memoryId: string | null = null;
 
-/** Guest id kept in localStorage; falls back to memory when storage is blocked. */
 export function guestId(): string {
-  if (memoryId) return memoryId;
+  let id: string | null = null;
   try {
-    const stored = localStorage.getItem(KEY);
-    if (stored && UUID_RE.test(stored)) return (memoryId = stored);
+    id = localStorage.getItem(KEY);
   } catch {
     /* storage blocked */
   }
-  const id = crypto.randomUUID?.() ?? uuidFromBytes(crypto.getRandomValues(new Uint8Array(16)));
-  memoryId = id;
-  try {
-    localStorage.setItem(KEY, id);
-  } catch {
-    /* storage blocked */
+  if (!id || !/^[0-9a-f-]{36}$/.test(id)) {
+    id = crypto.randomUUID();
+    try {
+      localStorage.setItem(KEY, id);
+    } catch {
+      /* storage blocked: guest id lives for this tab only */
+    }
   }
   return id;
-}
-
-export function forgetGuest(): void {
-  memoryId = null;
-  try {
-    localStorage.removeItem(KEY);
-  } catch {
-    /* ignore */
-  }
 }
 
 export class ApiError extends Error {
   constructor(
     public status: number,
     public code: string,
-    public body: Record<string, unknown>,
   ) {
-    super(`${status} ${code}`);
+    super(code);
   }
 }
 
-async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
+async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, {
     method,
-    headers: {
-      'x-guest-id': guestId(),
-      ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
-    },
+    headers: { 'x-guest-id': guestId(), ...(body !== undefined ? { 'content-type': 'application/json' } : {}) },
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   if (res.status === 204) return undefined as T;
-  const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-  if (!res.ok) throw new ApiError(res.status, String(json.error ?? res.statusText), json);
-  return json as T;
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new ApiError(res.status, (data as { error?: string }).error ?? 'error');
+  return data as T;
 }
 
-export interface DailySummary {
-  date: string;
-  number: number;
-  total: number;
-  rounds: Array<{ type: RoundType; score: number; guess: LatLon | null }>;
-}
-
-export interface LeaderboardResponse {
-  date: string;
-  scope: 'global' | 'country';
-  rows: LeaderboardRow[];
-  you: LeaderboardRow | null;
-}
+let configPromise: Promise<PublicConfig> | null = null;
 
 export const api = {
-  me: () => call<MeResponse>('GET', '/api/me'),
-  updateMe: (body: { displayName?: string; country?: string | null }) => call<MeResponse>('PUT', '/api/me', body),
-  deleteMe: () => call<void>('DELETE', '/api/me'),
-  today: () => call<DailyToday>('GET', '/api/daily/today'),
-  start: (snapshotId: string) => call<StartRoundResponse>('POST', '/api/rounds/start', { snapshotId, mode: 'daily' }),
-  clue: (roundId: string) => call<ClueResponse>('POST', `/api/rounds/${roundId}/clue`),
-  guess: (roundId: string, guess: LatLon | null) => call<GuessResponse>('POST', `/api/rounds/${roundId}/guess`, { guess }),
-  arcadeNext: () => call<StartRoundResponse>('GET', '/api/arcade/next'),
-  summary: (date: string) => call<DailySummary>('GET', `/api/daily/${date}/summary`),
-  leaderboard: (scope: 'global' | 'country', date: string) =>
-    call<LeaderboardResponse>('GET', `/api/leaderboard?scope=${scope}&date=${date}`),
-  attributions: () => call<Attribution[]>('GET', '/api/attributions'),
+  config: () => (configPromise ??= req<PublicConfig>('GET', '/api/config')),
+  me: () => req<MeResponse>('GET', '/api/me'),
+  updateMe: (patch: { displayName?: string; country?: string | null }) => req<MeResponse>('PUT', '/api/me', patch),
+  deleteMe: () => req<void>('DELETE', '/api/me'),
+  stats: () => req<ProfileStats>('GET', '/api/me/stats'),
+  maps: (kind?: 'official' | 'community') => req<MapSummary[]>('GET', `/api/maps${kind ? `?kind=${kind}` : ''}`),
+  map: (slug: string) => req<MapSummary>('GET', `/api/maps/${encodeURIComponent(slug)}`),
+  mapLeaderboard: (slug: string, mode: 'classic' | 'streak') => req<LeaderboardRow[]>('GET', `/api/maps/${encodeURIComponent(slug)}/leaderboard?mode=${mode}`),
+  startGame: (mapSlug: string, settings: Partial<GameSettings>, mode: 'classic' | 'streak' = 'classic') =>
+    req<GameState>('POST', '/api/games', { mapSlug, settings, mode }),
+  game: (id: string) => req<GameState>('GET', `/api/games/${id}`),
+  guess: (id: string, guess: LatLon | null) => req<GuessResponse>('POST', `/api/games/${id}/guess`, { guess }),
+  next: (id: string) => req<GameState>('POST', `/api/games/${id}/next`),
+  daily: () => req<ChallengeInfo>('GET', '/api/daily'),
+  createChallenge: (mapSlug: string, settings: Partial<GameSettings>) => req<{ token: string }>('POST', '/api/challenges', { mapSlug, settings }),
+  challenge: (token: string) => req<ChallengeInfo>('GET', `/api/challenges/${encodeURIComponent(token)}`),
+  playChallenge: (token: string) => req<GameState>('POST', `/api/challenges/${encodeURIComponent(token)}/play`),
+  challengeLeaderboard: (token: string) =>
+    req<{ rows: LeaderboardRow[]; you: LeaderboardRow | null }>('GET', `/api/challenges/${encodeURIComponent(token)}/leaderboard`),
+  ratingLeaderboard: () => req<LeaderboardRow[]>('GET', '/api/leaderboard/rating'),
+  countryAt: (p: LatLon) => req<{ country: CountryRef | null }>('GET', `/api/geo/country?lat=${p.lat}&lon=${p.lon}`),
+  maker: {
+    list: () => req<EditableMap[]>('GET', '/api/maker/maps'),
+    create: (name: string, description = '') => req<EditableMap>('POST', '/api/maker/maps', { name, description }),
+    get: (id: string) => req<EditableMap>('GET', `/api/maker/maps/${id}`),
+    update: (id: string, patch: { name?: string; description?: string; published?: boolean }) => req<EditableMap>('PATCH', `/api/maker/maps/${id}`, patch),
+    remove: (id: string) => req<void>('DELETE', `/api/maker/maps/${id}`),
+    addLocation: (id: string, point: LatLon) => req<EditableMap['locations'][number]>('POST', `/api/maker/maps/${id}/locations`, { point }),
+    removeLocation: (id: string, loc: string) => req<void>('DELETE', `/api/maker/maps/${id}/locations/${loc}`),
+  },
 };
+
+const ERRORS: Record<string, string> = {
+  map_not_found: 'That map does not exist or is not published.',
+  challenge_not_found: 'That challenge link is not valid.',
+  daily_closed: 'That daily has closed. Today’s is waiting.',
+  no_coverage: 'No street-level imagery near that point.',
+  duplicate_location: 'That panorama is already on the map.',
+  too_few_locations: 'Add at least 5 places before publishing.',
+  imagery_unavailable: 'Imagery is not configured on the server.',
+  map_too_small: 'This map has too few places for a challenge.',
+  party_not_found: 'No party with that code.',
+  party_full: 'That party is full.',
+  duel_needs_two: 'A duel needs exactly two players in the room.',
+  host_only: 'Only the host can do that.',
+  already_in_match: 'You are already in a match.',
+  rate_limited: 'Slow down a little.',
+  invalid_display_name: 'Names need at least 2 characters.',
+};
+
+export function errorText(e: unknown): string {
+  const code = e instanceof ApiError ? e.code : e instanceof Error ? e.message : String(e);
+  return ERRORS[code] ?? 'Something went wrong. Try again.';
+}
