@@ -12,6 +12,8 @@ import { seedLocations } from '../seed.ts';
 
 const { values } = parseArgs({
   options: { provider: { type: 'string' }, map: { type: 'string' }, count: { type: 'string' } },
+  // `pnpm locations:generate -- --map x` passes the `--` through; after it parseArgs would treat everything as positional.
+  args: process.argv.slice(2).filter((a) => a !== '--'),
   allowPositionals: true,
 });
 const config = loadConfig();

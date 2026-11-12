@@ -2,7 +2,8 @@ import { useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import type { ChallengeInfo, LeaderboardRow } from '@earthnow/shared';
 import { api, errorText } from '../api.ts';
-import { Flag, fmt, settingsLine, useTitle } from '../components/ui.tsx';
+import { Flag, fmt, plural, settingsLine, useTitle } from '../components/ui.tsx';
+import { serverNow } from '../hub.ts';
 import { useMe } from '../me.ts';
 
 export function ChallengeBoard({ token, highlight }: { token: string; highlight?: string }) {
@@ -47,6 +48,20 @@ export function Board({ rows, unit, highlight }: { rows: LeaderboardRow[]; unit?
   );
 }
 
+/** " · next one in 6 h 12 min": the daily resets at 00:00 UTC. */
+function NextDaily() {
+  const [now, setNow] = useState(serverNow);
+  useEffect(() => {
+    const id = setInterval(() => setNow(serverNow()), 30_000);
+    return () => clearInterval(id);
+  }, []);
+  const d = new Date(now);
+  const next = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1);
+  const mins = Math.max(1, Math.ceil((next - now) / 60_000));
+  const h = Math.floor(mins / 60);
+  return <> · next one in {h ? `${h} h ${mins % 60} min` : `${mins} min`}</>;
+}
+
 /** Landing for a challenge link, and for the daily (`daily` prop). */
 export function ChallengePage({ daily = false }: { daily?: boolean }) {
   const { token } = useParams<{ token: string }>();
@@ -58,7 +73,17 @@ export function ChallengePage({ daily = false }: { daily?: boolean }) {
   useTitle(daily ? 'Daily' : 'Challenge');
 
   useEffect(() => {
-    (daily ? api.daily() : api.challenge(token!)).then(setInfo).catch((e) => setError(errorText(e)));
+    // /daily and /challenge/:token share this component; start clean on every switch.
+    let live = true;
+    setInfo(null);
+    setError(null);
+    setBusy(false);
+    (daily ? api.daily() : api.challenge(token!))
+      .then((i) => live && setInfo(i))
+      .catch((e) => live && setError(errorText(e)));
+    return () => {
+      live = false;
+    };
   }, [daily, token]);
 
   async function play() {
@@ -85,14 +110,17 @@ export function ChallengePage({ daily = false }: { daily?: boolean }) {
 
   return (
     <div className="page narrow">
-      <p className="eyebrow">{info.dailyNumber ? `Daily #${info.dailyNumber} · ${info.date}` : `Challenge from ${info.creatorName ?? 'a friend'}`}</p>
-      <h1 className="display">{info.dailyNumber ? 'Five places. Same for everyone.' : `${info.map.name}, five rounds`}</h1>
-      <p className="lead">
-        {info.map.name} · {settingsLine(info.settings)} · {fmt(info.plays)} {info.plays === 1 ? 'player' : 'players'} so far
+      <h1 className="display">{info.dailyNumber ? 'Five places. Same for everyone.' : `${info.creatorName ?? 'A friend'} challenged you`}</h1>
+      <p className="facts">
+        <span>{info.dailyNumber ? `Daily #${info.dailyNumber}` : `${info.map.name}, five rounds`}</span>
+        {info.dailyNumber && <span>{info.map.name}</span>}
+        <span>{settingsLine(info.settings)}</span>
+        <span>{plural(info.plays, 'player')} so far</span>
       </p>
       {daily && me && (
         <p className="streak-line">
           Daily streak <strong>{me.dailyStreak.current}</strong> · best {me.dailyStreak.best}
+          <NextDaily />
         </p>
       )}
       <div className="actions">

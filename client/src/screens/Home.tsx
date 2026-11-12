@@ -2,7 +2,8 @@ import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import type { ChallengeInfo, MapSummary } from '@earthnow/shared';
 import { api, errorText } from '../api.ts';
-import { fmt, settingsLine, useTitle } from '../components/ui.tsx';
+import { plural, settingsLine, useTitle } from '../components/ui.tsx';
+import { IconArrowRight, IconFlag, IconPencil, IconUsers, IconShield } from '../components/icons.tsx';
 import { useMe } from '../me.ts';
 import { MapCard } from './MapsPage.tsx';
 
@@ -42,7 +43,6 @@ export function Home() {
     <div className="home">
       <section className="hero">
         <div className="hero-copy">
-          <p className="eyebrow">Street-level geography</p>
           <h1 className="display">
             You’re standing somewhere on Earth. <em>Where?</em>
           </h1>
@@ -56,55 +56,65 @@ export function Home() {
             </Link>
           </div>
           {error && <p role="alert">{error}</p>}
+          <form className="join" onSubmit={joinCode}>
+            <label htmlFor="join-code">Got a code from a friend?</label>
+            <span className="join-row">
+              <input id="join-code" value={code} onChange={(e) => setCode(e.target.value)} placeholder="Party code or challenge link" autoComplete="off" spellCheck={false} />
+              <button type="submit" className="btn" disabled={!code.trim()}>
+                Join
+              </button>
+            </span>
+          </form>
         </div>
         {daily && (
           <Link to="/daily" className="daily-card">
-            <span className="eyebrow">Daily #{daily.dailyNumber}</span>
-            <strong>{daily.finished ? 'Done for today' : 'Today’s five places'}</strong>
-            <span className="muted">{settingsLine(daily.settings)}</span>
-            <span className="daily-meta">
-              <span>{fmt(daily.plays)} played</span>
-              {me && <span>Streak {me.dailyStreak.current}</span>}
+            <span className="daily-top">
+              <span>Daily #{daily.dailyNumber}</span>
+              {me && me.dailyStreak.current > 0 && <span>{plural(me.dailyStreak.current, 'day')} in a row</span>}
             </span>
-            <span className="daily-go">{daily.finished ? 'See the leaderboard →' : 'Play →'}</span>
+            <strong>{daily.finished ? 'Done for today' : 'Today’s five places'}</strong>
+            <span className="daily-sub">
+              {settingsLine(daily.settings)} · {plural(daily.plays, 'player')} so far
+            </span>
+            <span className="daily-go">
+              {daily.finished ? 'See how you ranked' : 'Play today’s daily'} <IconArrowRight size={18} />
+            </span>
           </Link>
         )}
       </section>
 
-      <section className="modes" aria-label="Game modes">
-        <button type="button" className="mode" onClick={() => void quick('streak')}>
-          <span className="mode-k">Country streak</span>
-          <span className="mode-d">Name the country. One wrong answer ends it.</span>
+      <section className="ways" aria-labelledby="ways-h">
+        <h2 id="ways-h" className="sr-only">
+          More ways to play
+        </h2>
+        <button type="button" className="way" onClick={() => void quick('streak')}>
+          <IconFlag />
+          <span className="way-k">Country streak</span>
+          <span className="way-d">Name the country. One wrong answer ends it.</span>
         </button>
-        <Link to="/duels" className="mode">
-          <span className="mode-k">Duels</span>
-          <span className="mode-d">1 v 1, live. Out-guess them to drain their health.</span>
+        <Link to="/duels" className="way">
+          <IconShield />
+          <span className="way-k">Duels</span>
+          <span className="way-d">1 v 1, live. Out-guess them to drain their health.</span>
         </Link>
-        <Link to="/party" className="mode">
-          <span className="mode-k">Party</span>
-          <span className="mode-d">Private room for up to 8 friends. Share a code, play together.</span>
+        <Link to="/party" className="way">
+          <IconUsers />
+          <span className="way-k">Party</span>
+          <span className="way-d">A private room for up to 8 friends. Share a code.</span>
         </Link>
-        <Link to="/create" className="mode">
-          <span className="mode-k">Map maker</span>
-          <span className="mode-d">Pick your own places and publish a map for everyone.</span>
+        <Link to="/create" className="way">
+          <IconPencil />
+          <span className="way-k">Map maker</span>
+          <span className="way-d">Pick your own places and publish a map.</span>
         </Link>
-        <form className="mode mode-form" onSubmit={joinCode}>
-          <label className="mode-k" htmlFor="join-code">
-            Got a code?
-          </label>
-          <span className="mode-row">
-            <input id="join-code" value={code} onChange={(e) => setCode(e.target.value)} placeholder="Party code or challenge link" autoComplete="off" />
-            <button type="submit" className="btn">
-              Join
-            </button>
-          </span>
-        </form>
       </section>
 
       <section>
         <div className="section-head">
           <h2>Maps</h2>
-          <Link to="/maps">All maps →</Link>
+          <Link to="/maps" className="text-link">
+            All maps <IconArrowRight size={16} />
+          </Link>
         </div>
         <div className="map-grid">
           {maps.slice(0, 8).map((m) => (

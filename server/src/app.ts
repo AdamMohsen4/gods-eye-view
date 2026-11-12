@@ -1,4 +1,4 @@
-import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import rateLimit from '@fastify/rate-limit';
 import websocket from '@fastify/websocket';
 import { timingSafeEqual } from 'node:crypto';
@@ -9,6 +9,7 @@ import type { Config } from './config.ts';
 import { countryAt, countryRef } from './countries.ts';
 import { Game, GameError } from './game.ts';
 import { MapMaker } from './mapmaker.ts';
+import { Friends } from './friends.ts';
 import { Hub, type HubOptions } from './multiplayer/hub.ts';
 import { ProviderUnavailable } from './imagery/index.ts';
 import { shareCardPng } from './shareImage.ts';
@@ -26,10 +27,13 @@ export interface AppOptions {
 }
 
 export async function buildApp({ db, config, now = () => new Date(), logger = false, hub: hubOpts }: AppOptions) {
-  const app = Fastify({ logger, trustProxy: true, bodyLimit: 16 * 1024 });
+  // Fastify accepts a boolean, hop count or IP list here; the cast only picks the http1 overload.
+  const app = Fastify({ logger, trustProxy: config.trustProxy as boolean, bodyLimit: 16 * 1024 });
   const game = new Game(db, config, now);
   const maker = new MapMaker(db, config);
   const hub = new Hub(db, game, config, hubOpts);
+  const friends = new Friends(db, (id) => hub.online(id));
+  hub.friends = friends;
 
   await app.register(rateLimit, { global: true, max: config.rateLimitMax, timeWindow: '1 minute' });
   await app.register(websocket, { options: { maxPayload: 4096 } });
@@ -68,15 +72,31 @@ export async function buildApp({ db, config, now = () => new Date(), logger = fa
 
   /* ------------------------------- realtime ------------------------------ */
 
-  app.get('/ws', { websocket: true }, (socket) => {
+  // A handful of tabs per IP is normal; hundreds of sockets is not.
+  const WS_PER_IP = 20;
+  const wsPerIp = new Map<string, number>();
+  app.get('/ws', { websocket: true }, (socket, req) => {
+    const ip = req.ip;
+    const n = (wsPerIp.get(ip) ?? 0) + 1;
+    if (n > WS_PER_IP) {
+      socket.close(1008, 'too_many_connections');
+      return;
+    }
+    wsPerIp.set(ip, n);
     const onMessage = hub.connect(socket);
     socket.on('message', (data: Buffer) => void onMessage(data.toString()));
-    socket.on('close', () => hub.disconnect(socket));
+    socket.on('close', () => {
+      const left = (wsPerIp.get(ip) ?? 1) - 1;
+      if (left <= 0) wsPerIp.delete(ip);
+      else wsPerIp.set(ip, left);
+      hub.disconnect(socket);
+    });
   });
 
   /* -------------------------------- basics ------------------------------- */
 
-  app.get('/api/health', async () => ({ ok: true }));
+  // `now` lets clients estimate clock skew for round timers.
+  app.get('/api/health', async () => ({ ok: true, now: now().getTime() }));
   app.get('/api/config', async (): Promise<PublicConfig> => ({
     provider: config.provider,
     mapillaryToken: config.provider === 'mapillary' ? config.mapillaryClientToken : null,
@@ -98,6 +118,11 @@ export async function buildApp({ db, config, now = () => new Date(), logger = fa
     return reply.status(204).send();
   });
   app.get('/api/me/stats', async (req) => game.stats(await must(req)));
+
+  app.get('/api/friends', async (req) => friends.list(await must(req)));
+  app.post('/api/friends', { config: { rateLimit: { max: 20 } } }, async (req) => friends.request(await must(req), body(req).code));
+  app.post<{ Params: { id: string } }>('/api/friends/:id/accept', async (req) => friends.accept(await must(req), uuidParam(req.params.id)));
+  app.delete<{ Params: { id: string } }>('/api/friends/:id', async (req) => friends.remove(await must(req), uuidParam(req.params.id)));
 
   /* --------------------------------- maps -------------------------------- */
 
@@ -240,5 +265,7 @@ export async function buildApp({ db, config, now = () => new Date(), logger = fa
     return row;
   });
 
-  return Object.assign(app, { hub, game });
+  // Fastify instances are thenable; typing it as a plain FastifyInstance keeps
+  // the async return type from unwrapping away hub/game.
+  return Object.assign(app as FastifyInstance, { hub, game });
 }

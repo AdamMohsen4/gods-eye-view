@@ -10,7 +10,7 @@ import { isLatLon, type EditableMap } from '@earthnow/shared';
 import type { Config } from './config.ts';
 import { countryAt } from './countries.ts';
 import { GameError } from './game.ts';
-import { imageryProvider } from './imagery/index.ts';
+import { ImageryError, imageryProvider } from './imagery/index.ts';
 
 export const MIN_LOCATIONS_TO_PUBLISH = 5;
 export const MAX_LOCATIONS = 2000;
@@ -103,7 +103,14 @@ export class MapMaker {
     const [c] = rowsOf<{ n: number }>(await this.db.execute(sql`SELECT count(*)::int AS n FROM locations WHERE map_id = ${m.id}`));
     if ((c?.n ?? 0) >= MAX_LOCATIONS) throw new GameError(409, 'map_full');
     const provider = imageryProvider(this.config.provider, this.config);
-    const found = await provider.findPano({ lat: raw.lat, lon: raw.lon }, 1000);
+    const found = await provider.findPano({ lat: raw.lat, lon: raw.lon }, 1000).catch((e: unknown) => {
+      // A provider outage is not "no coverage here".
+      if (e instanceof ImageryError) {
+        console.error('[maker]', e.message);
+        throw new GameError(503, 'imagery_unavailable');
+      }
+      throw e;
+    });
     if (!found) throw new GameError(422, 'no_coverage');
     const [row] = await this.db
       .insert(locations)

@@ -18,6 +18,17 @@ export interface Config {
   rateLimitMax: number;
   /** Duel: seconds the other player gets once someone has guessed. */
   duelCountdownSeconds: number;
+  /**
+   * Fastify trustProxy: false (default), a hop count, or a comma list of proxy IPs/CIDRs.
+   * Only trust X-Forwarded-For from your own proxy, or clients can dodge rate limits.
+   */
+  trustProxy: boolean | number | string;
+}
+
+function trustProxy(v: string | undefined): boolean | number | string {
+  if (!v || v === 'false' || v === '0') return false;
+  if (v === 'true') return true;
+  return /^\d+$/.test(v) ? Number(v) : v;
 }
 
 function provider(v: string | undefined): Provider {
@@ -38,5 +49,6 @@ export function loadConfig(env = process.env): Config {
     publicOrigin: (env.PUBLIC_ORIGIN ?? 'http://localhost:5173').replace(/\/$/, ''),
     rateLimitMax: Number(env.RATE_LIMIT_MAX ?? 240),
     duelCountdownSeconds: Number(env.DUEL_COUNTDOWN_SECONDS ?? 15),
+    trustProxy: trustProxy(env.TRUST_PROXY),
   };
 }

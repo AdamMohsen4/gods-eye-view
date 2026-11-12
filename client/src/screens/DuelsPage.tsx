@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import type { LeaderboardRow } from '@earthnow/shared';
 import { api, errorText } from '../api.ts';
-import { clearError, send, useHub } from '../hub.ts';
+import { clearError, getHub, send, serverNow, useHub } from '../hub.ts';
 import { useTitle } from '../components/ui.tsx';
 import { useMe, refreshMe } from '../me.ts';
 import { Board } from './ChallengePage.tsx';
@@ -9,6 +10,8 @@ import { MatchView } from './MatchView.tsx';
 
 export function DuelsPage() {
   useTitle('Duels');
+  // hub.error is global; don't show one left over from another page.
+  useEffect(() => clearError(), []);
   const hub = useHub();
   const me = useMe();
   const [active, setActive] = useState<string | null>(null);
@@ -36,10 +39,18 @@ export function DuelsPage() {
     }
   }, [hub.matches, hub.party?.matchId]);
 
-  const [now, setNow] = useState(Date.now());
+  // Leaving the page leaves the queue, so a duel never starts while you're elsewhere.
+  useEffect(
+    () => () => {
+      if (getHub().queue.waiting) send({ t: 'queue.leave' });
+    },
+    [],
+  );
+
+  const [now, setNow] = useState(serverNow());
   useEffect(() => {
     if (!hub.queue.waiting) return;
-    const id = setInterval(() => setNow(Date.now()), 500);
+    const id = setInterval(() => setNow(serverNow()), 500);
     return () => clearInterval(id);
   }, [hub.queue.waiting]);
 
@@ -61,8 +72,12 @@ export function DuelsPage() {
   return (
     <div className="page duels">
       <div>
-        <p className="eyebrow">1 v 1 · World map · Moving</p>
         <h1 className="display">Duels</h1>
+        <p className="facts">
+          <span>1 v 1</span>
+          <span>World map</span>
+          <span>Moving</span>
+        </p>
         <p className="lead">
           Both of you see the same place. When one locks in, the other has 15 seconds. Each round, the worse guess loses the difference in points from their 5,000 health. From round 4 the damage multiplies.
         </p>
@@ -89,12 +104,15 @@ export function DuelsPage() {
             </div>
           )}
           <p className="muted small">
-            Your rating: <strong>{me?.rating ?? 1000}</strong> · To duel a friend, open a <a href="/party">party</a> and set the format to Duel.
+            Your rating: <strong>{me?.rating ?? 1000}</strong> · To duel a friend, open a <Link to="/party">party</Link> and set the format to Duel.
           </p>
           {hub.status !== 'online' && <p className="muted small">Connecting…</p>}
           {hub.error && (
-            <p role="alert" onClick={clearError}>
-              {errorText(new Error(hub.error.code))}
+            <p role="alert" className="form-error">
+              {errorText(new Error(hub.error.code))}{' '}
+              <button type="button" className="link-btn" onClick={clearError}>
+                Dismiss
+              </button>
             </p>
           )}
         </div>

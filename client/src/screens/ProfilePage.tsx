@@ -2,8 +2,10 @@ import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import type { ProfileStats } from '@earthnow/shared';
 import { api, errorText } from '../api.ts';
-import { Flag, ISO_CODES, countryLabel, fmt, useTitle } from '../components/ui.tsx';
+import { Flag, ISO_CODES, countryLabel, fmt, plural, useTitle } from '../components/ui.tsx';
 import { setMe, useMe } from '../me.ts';
+import { FriendsPanel } from '../components/FriendsPanel.tsx';
+import { IconStar } from '../components/icons.tsx';
 
 const MODE_LABEL = { classic: 'Classic', daily: 'Daily', challenge: 'Challenge', streak: 'Streak' } as const;
 
@@ -44,7 +46,6 @@ export function ProfilePage() {
   return (
     <div className="page profile">
       <section>
-        <p className="eyebrow">Profile</p>
         <h1 className="display">
           <Flag code={me?.country} /> {me?.displayName ?? '…'}
         </h1>
@@ -111,20 +112,63 @@ export function ProfilePage() {
             </button>
           )}
         </p>
+        <FriendsPanel />
       </section>
       <section>
         {stats && (
           <>
-            <div className="stat-grid">
-              <Stat k="Games" v={fmt(stats.gamesPlayed)} />
-              <Stat k="Average round" v={fmt(stats.averageScore)} />
-              <Stat k="Best game" v={fmt(stats.bestGame)} />
-              <Stat k="Perfect rounds" v={fmt(stats.perfectRounds)} />
-              <Stat k="Best streak" v={fmt(stats.bestStreak)} />
-              <Stat k="Daily streak" v={`${me?.dailyStreak.current ?? 0} (best ${me?.dailyStreak.best ?? 0})`} />
-              <Stat k="Duel rating" v={fmt(stats.duels.rating)} />
-              <Stat k="Duels won" v={`${stats.duels.won} / ${stats.duels.played}`} />
+            <div className="panel record">
+              <h3>Your record</h3>
+              <dl>
+                <div className="record-group">
+                  <dt>Solo</dt>
+                  <dd>
+                    <Stat k="Games finished" v={fmt(stats.gamesPlayed)} />
+                    <Stat k="Average round" v={fmt(stats.averageScore)} />
+                    <Stat k="Best game" v={fmt(stats.bestGame)} />
+                    <Stat k="Perfect rounds" v={fmt(stats.perfectRounds)} />
+                  </dd>
+                </div>
+                <div className="record-group">
+                  <dt>Streaks</dt>
+                  <dd>
+                    <Stat k="Best country streak" v={fmt(stats.bestStreak)} />
+                    <Stat k="Daily streak" v={fmt(me?.dailyStreak.current ?? 0)} note={`best ${me?.dailyStreak.best ?? 0}`} />
+                  </dd>
+                </div>
+                <div className="record-group">
+                  <dt>Duels</dt>
+                  <dd>
+                    <Stat k="Rating" v={fmt(stats.duels.rating)} />
+                    <Stat k="Won" v={fmt(stats.duels.won)} note={`of ${fmt(stats.duels.played)}`} />
+                  </dd>
+                </div>
+              </dl>
             </div>
+            <section className="panel badges" aria-labelledby="badges-h">
+              <h3 id="badges-h">
+                Badges <small className="muted">{stats.badges.filter((b) => b.earned).length} of {stats.badges.length}</small>
+              </h3>
+              <ul className="badge-list">
+                {stats.badges.map((b) => (
+                  <li key={b.id} className={b.earned ? 'earned' : ''}>
+                    <span className="badge-mark" aria-hidden="true">
+                      <IconStar size={18} />
+                    </span>
+                    <span className="badge-text">
+                      <strong>{b.name}</strong>
+                      <span className="muted small">{b.description}</span>
+                      {!b.earned && b.goal > 1 && (
+                        <span className="badge-progress" role="progressbar" aria-valuemin={b.start} aria-valuemax={b.goal} aria-valuenow={b.progress} aria-label={`${b.name} progress`}>
+                          <span style={{ transform: `scaleX(${Math.max(0, b.progress - b.start) / (b.goal - b.start)})` }} />
+                        </span>
+                      )}
+                    </span>
+                    <span className="badge-state">{b.earned ? 'Earned' : b.goal > 1 ? `${fmt(b.progress)} / ${fmt(b.goal)}` : ''}</span>
+                  </li>
+                ))}
+              </ul>
+            </section>
             <div className="panel">
               <h3>Recent games</h3>
               {stats.recent.length ? (
@@ -152,7 +196,7 @@ export function ProfilePage() {
                   {stats.countries.map((c) => (
                     <li key={c.code}>
                       <Flag code={c.code} /> {c.name}
-                      <span className="muted">{c.rounds} rounds</span>
+                      <span className="muted">{plural(c.rounds, 'round')}</span>
                       <strong>{fmt(c.averageScore)}</strong>
                     </li>
                   ))}
@@ -166,11 +210,14 @@ export function ProfilePage() {
   );
 }
 
-function Stat({ k, v }: { k: string; v: string }) {
+function Stat({ k, v, note }: { k: string; v: string; note?: string }) {
   return (
-    <div className="stat">
+    <span className="stat">
+      <span className="stat-v">
+        {v}
+        {note && <small> {note}</small>}
+      </span>
       <span className="stat-k">{k}</span>
-      <span className="stat-v">{v}</span>
-    </div>
+    </span>
   );
 }

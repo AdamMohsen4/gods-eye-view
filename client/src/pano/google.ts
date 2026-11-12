@@ -11,7 +11,7 @@ let loader: Loader | null = null;
 export const mountGoogle: PanoMount = async (el, { pano, move, config, onReady, onError }) => {
   if (!config.googleKey) throw new Error('Google Maps key missing');
   loader ??= new Loader({ apiKey: config.googleKey, version: 'weekly' });
-  const { StreetViewPanorama, StreetViewStatus, StreetViewService } = await loader.importLibrary('streetView');
+  const { StreetViewPanorama, StreetViewStatus } = await loader.importLibrary('streetView');
   const canMove = move === 'move';
   const locked = move === 'nmpz';
   const container = document.createElement('div');
@@ -36,24 +36,35 @@ export const mountGoogle: PanoMount = async (el, { pano, move, config, onReady, 
     scrollwheel: !locked,
     disableDoubleClickZoom: true,
   });
-  // No-move: the arrow keys and links would still walk, so snap back to the start pano.
+  // No-move: snap back if anything still walks (a safety net; keys are blocked below).
   if (!canMove) view.addListener('pano_changed', () => view.getPano() !== pano.panoId && view.setPano(pano.panoId));
+  // Street View has no option to turn its keyboard off, so intercept keys in the
+  // capture phase: no-move blocks walking keys, NMPZ blocks every key.
+  const WALK_KEYS = new Set(['ArrowUp', 'ArrowDown', 'w', 'W', 's', 'S', 'PageUp', 'PageDown']);
+  if (!canMove) {
+    container.addEventListener(
+      'keydown',
+      (e) => {
+        if (locked || WALK_KEYS.has(e.key)) {
+          e.stopPropagation();
+          e.preventDefault();
+        }
+      },
+      true,
+    );
+  }
   // NMPZ: a transparent shield swallows drags and pinches.
   let shield: HTMLDivElement | null = null;
   if (locked) {
     shield = document.createElement('div');
     shield.className = 'pano-shield';
     el.appendChild(shield);
-    // Arrow keys would still pan and walk.
-    container.addEventListener('keydown', (e) => e.stopPropagation(), true);
-    container.addEventListener('keydown', (e) => e.preventDefault(), true);
   }
   view.addListener('status_changed', () => {
     const s = view.getStatus();
     if (s === StreetViewStatus.OK) onReady?.();
     else onError?.(`Street View: ${s}`);
   });
-  void StreetViewService;
   return {
     reset() {
       view.setPano(pano.panoId);
@@ -61,6 +72,9 @@ export const mountGoogle: PanoMount = async (el, { pano, move, config, onReady, 
       view.setZoom(0);
     },
     destroy() {
+      // Release the panorama so long sessions don't pile up WebGL contexts.
+      google.maps.event.clearInstanceListeners(view);
+      view.setVisible(false);
       shield?.remove();
       container.remove();
     },

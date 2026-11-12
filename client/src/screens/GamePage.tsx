@@ -7,6 +7,7 @@ import { ResultMap } from '../map/ResultMap.tsx';
 import { GuessPanel } from '../components/GuessPanel.tsx';
 import { Flag, ScoreBar, Timer, copy, fmt, settingsLine, useCountdown, useTitle } from '../components/ui.tsx';
 import { ChallengeBoard } from './ChallengePage.tsx';
+import { IconCheck, IconClose, IconReturn, IconShare, IconCopy } from '../components/icons.tsx';
 import { refreshMe } from '../me.ts';
 
 export function GamePage() {
@@ -22,14 +23,21 @@ export function GamePage() {
   useTitle(game ? game.map.name : 'Game');
 
   useEffect(() => {
+    // "Play again" reuses this component for the new id, so reset everything.
     let cancelled = false;
     setGame(null);
     setReveal(null);
+    setPin(null);
+    setError(null);
+    setBusy(false);
+    submitted.current = false;
     void (async () => {
       let g = await api.game(id!);
       if (g.status === 'active' && !g.current) g = await api.next(id!);
       if (!cancelled) setGame(g);
-    })().catch((e) => setError(errorText(e)));
+    })().catch((e) => {
+      if (!cancelled) setError(errorText(e));
+    });
     return () => {
       cancelled = true;
     };
@@ -56,7 +64,7 @@ export function GamePage() {
   );
 
   const nextRound = useCallback(async () => {
-    if (!game) return;
+    if (!game || busy) return;
     if (game.status === 'finished') {
       setReveal(null);
       return;
@@ -73,7 +81,7 @@ export function GamePage() {
     } finally {
       setBusy(false);
     }
-  }, [game]);
+  }, [game, busy]);
 
   const left = useCountdown(!reveal ? (game?.current?.deadline ?? null) : null);
   useEffect(() => {
@@ -83,11 +91,15 @@ export function GamePage() {
   // Space / Enter: lock in, then continue.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      // Let focused controls handle their own keys (e.g. Enter on "Return to start").
+      const t = e.target;
+      if (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement || t instanceof HTMLSelectElement || t instanceof HTMLButtonElement || t instanceof HTMLAnchorElement) return;
       if (e.key !== ' ' && e.key !== 'Enter') return;
+      // Holding the key after a guess must not skip straight past the reveal.
+      if (e.repeat) return;
       if (reveal) {
         e.preventDefault();
-        void nextRound();
+        if (!busy) void nextRound();
       } else if (pin && game?.current && !busy) {
         e.preventDefault();
         void submit(pin);
@@ -138,7 +150,7 @@ export function GamePage() {
           </div>
           {game.settings.move === 'move' && (
             <button type="button" className="btn btn-glass return-btn" onClick={() => pano.current?.reset()} title="Back to where you started">
-              ⟲ Return to start
+              <IconReturn size={18} /> Return to start
             </button>
           )}
           <GuessPanel pin={pin} onPin={setPin} onGuess={() => void submit(pin)} busy={busy} showCountry={streak} />
@@ -155,14 +167,16 @@ function RoundReveal({ game, reveal, onNext, busy }: { game: GameState; reveal: 
   const finishText = reveal.finished ? (streak ? 'See your streak' : 'See results') : 'Next round';
   return (
     <div className="reveal">
-      <ResultMap pairs={[{ truth: r.truth, guesses: [{ at: r.guess }] }]} padding={{ top: 80, bottom: 360, left: 60, right: 60 }} />
+      <ResultMap pairs={[{ truth: r.truth, guesses: [{ at: r.guess }] }]} padding={{ top: 110, bottom: 360, left: 80, right: 80 }} />
       <section className="reveal-card" aria-live="polite">
         {streak ? (
           <>
-            <p className="eyebrow">{r.correct ? 'Correct' : 'Streak over'}</p>
-            <h2>
-              <Flag code={r.country?.code} /> {r.country?.name ?? 'Unknown'}
+            <h2 className={`verdict ${r.correct ? 'is-ok' : 'is-bad'}`}>
+              {r.correct ? <IconCheck size={26} /> : <IconClose size={26} />} {r.correct ? 'Correct' : 'Streak over'}
             </h2>
+            <p className="reveal-place-line">
+              It was <Flag code={r.country?.code} /> <strong>{r.country?.name ?? 'somewhere unknown'}</strong>.
+            </p>
             <p className="muted">
               {r.correct
                 ? `That’s ${reveal.streak} in a row.`
@@ -175,9 +189,6 @@ function RoundReveal({ game, reveal, onNext, busy }: { game: GameState; reveal: 
           </>
         ) : (
           <>
-            <p className="eyebrow">
-              Round {r.index + 1} of {game.settings.rounds}
-            </p>
             <h2 className="score-big">
               {fmt(r.score)} <small>points</small>
             </h2>
@@ -198,7 +209,13 @@ function RoundReveal({ game, reveal, onNext, busy }: { game: GameState; reveal: 
         <button type="button" className="btn btn-primary" onClick={onNext} disabled={busy} autoFocus data-testid="next-button">
           {finishText}
         </button>
-        <span className="kbd-hint">or press Space</span>
+        <span className="kbd-hint">
+          {streak ? `Streak ${reveal.streak}` : `Round ${r.index + 1} of ${game.settings.rounds}`}
+          <span className="kbd-only">
+            {' '}
+            · or press <kbd>Space</kbd>
+          </span>
+        </span>
       </section>
     </div>
   );
@@ -207,19 +224,31 @@ function RoundReveal({ game, reveal, onNext, busy }: { game: GameState; reveal: 
 function Summary({ game }: { game: GameState }) {
   const nav = useNavigate();
   const [note, setNote] = useState<string | null>(null);
+  const [starting, setStarting] = useState(false);
   const streak = game.mode === 'streak';
   const isChallenge = !!game.challengeToken;
   const shareUrl = `${location.origin}/share/${game.id}`;
 
   async function again() {
-    const g = await api.startGame(game.map.slug, game.settings, streak ? 'streak' : 'classic');
-    nav(`/game/${g.id}`);
+    if (starting) return;
+    setStarting(true);
+    try {
+      const g = await api.startGame(game.map.slug, game.settings, streak ? 'streak' : 'classic');
+      nav(`/game/${g.id}`);
+    } catch (e) {
+      setNote(errorText(e));
+      setStarting(false);
+    }
   }
   async function challenge() {
-    const url = game.challengeToken
-      ? `${location.origin}/challenge/${game.challengeToken}`
-      : `${location.origin}/challenge/${(await api.createChallenge(game.map.slug, game.settings)).token}`;
-    setNote((await copy(url)) ? 'Challenge link copied. Send it to a friend.' : url);
+    try {
+      const url = game.challengeToken
+        ? `${location.origin}/challenge/${game.challengeToken}`
+        : `${location.origin}/challenge/${(await api.createChallenge(game.map.slug, game.settings)).token}`;
+      setNote((await copy(url)) ? 'Challenge link copied. Send it to a friend.' : url);
+    } catch (e) {
+      setNote(errorText(e));
+    }
   }
   async function share() {
     const title = game.dailyNumber ? `Earthnow Daily #${game.dailyNumber}` : `Earthnow · ${game.map.name}`;
@@ -239,12 +268,10 @@ function Summary({ game }: { game: GameState }) {
     <div className="summary">
       <ResultMap
         pairs={game.rounds.map((r) => ({ truth: r.truth, guesses: [{ at: r.guess }], truthLabel: String(r.index + 1) }))}
-        padding={{ top: 60, bottom: 60, left: 60, right: 460 }}
+        // The card docks right on desktop and along the bottom (62% tall) on phones.
+        padding={(w, h) => (w <= 820 ? { top: 90, bottom: h * 0.62 + 30, left: 40, right: 40 } : { top: 90, bottom: 60, left: 70, right: 470 })}
       />
       <aside className="summary-card">
-        <p className="eyebrow">
-          {game.dailyNumber ? `Daily #${game.dailyNumber}` : isChallenge ? 'Challenge' : streak ? 'Country streak' : 'Game over'} · {game.map.name}
-        </p>
         {streak ? (
           <h1 className="score-huge">
             {game.streak} <small>{game.streak === 1 ? 'country' : 'countries'} in a row</small>
@@ -254,7 +281,11 @@ function Summary({ game }: { game: GameState }) {
             {fmt(game.totalScore)} <small>/ {fmt(game.settings.rounds * 5000)}</small>
           </h1>
         )}
-        <p className="muted">{settingsLine(game.settings)}</p>
+        <p className="facts">
+          <span>{game.dailyNumber ? `Daily #${game.dailyNumber}` : isChallenge ? 'Challenge' : streak ? 'Country streak' : 'Classic'}</span>
+          <span>{game.map.name}</span>
+          <span>{settingsLine(game.settings)}</span>
+        </p>
         <ol className="round-list">
           {game.rounds.map((r) => (
             <li key={r.index}>
@@ -263,7 +294,9 @@ function Summary({ game }: { game: GameState }) {
                 <Flag code={r.country?.code} /> {r.country?.name ?? '—'}
               </span>
               {streak ? (
-                <span className={r.correct ? 'ok' : 'bad'}>{r.correct ? '✓' : `✕ ${r.guessCountry?.name ?? 'no country'}`}</span>
+                <span className={`round-verdict ${r.correct ? 'ok' : 'bad'}`}>
+                  {r.correct ? <><IconCheck size={18} /><span className="sr-only">Correct</span></> : <><IconClose size={16} /> {r.guessCountry?.name ?? 'no country'}</>}
+                </span>
               ) : (
                 <>
                   <span className="round-dist">{r.timedOut ? 'timed out' : formatDistance(r.distanceKm)}</span>
@@ -275,17 +308,19 @@ function Summary({ game }: { game: GameState }) {
         </ol>
         <div className="actions">
           {!isChallenge && (
-            <button type="button" className="btn btn-primary" onClick={() => void again()}>
+            <button type="button" className="btn btn-primary" onClick={() => void again()} disabled={starting}>
               Play again
             </button>
           )}
           {!streak && (
             <button type="button" className="btn" onClick={() => void share()}>
+              <IconShare size={18} />
               Share result
             </button>
           )}
           {!streak && !game.dailyNumber && (
             <button type="button" className="btn" onClick={() => void challenge()}>
+              <IconCopy size={18} />
               {isChallenge ? 'Copy challenge link' : 'Challenge a friend'}
             </button>
           )}

@@ -1,5 +1,9 @@
 import { defineConfig, devices } from '@playwright/test';
 
+// Own ports, so a run never reuses (or writes test games into) a `pnpm dev` server
+// and its persistent .data database. The test server is in-memory and seeded fresh.
+const API_PORT = 8797;
+const WEB_PORT = 5183;
 const reuse = !process.env.CI;
 
 export default defineConfig({
@@ -12,7 +16,7 @@ export default defineConfig({
   retries: process.env.CI ? 1 : 0,
   reporter: [['list']],
   use: {
-    baseURL: 'http://localhost:5173',
+    baseURL: `http://localhost:${WEB_PORT}`,
     trace: 'retain-on-failure',
     launchOptions: { args: ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'] },
   },
@@ -22,16 +26,16 @@ export default defineConfig({
   ],
   webServer: [
     {
-      command: 'MAP_STYLE=offline pnpm --filter ./server start:test',
+      command: `MAP_STYLE=offline PORT=${API_PORT} pnpm --filter ./server start:test`,
       cwd: '..',
-      url: 'http://127.0.0.1:8787/api/health',
+      url: `http://127.0.0.1:${API_PORT}/api/health`,
       reuseExistingServer: reuse,
       timeout: 120_000,
       stdout: 'pipe',
     },
     {
-      command: 'pnpm exec vite --port 5173 --strictPort',
-      url: 'http://localhost:5173',
+      command: `EARTHNOW_API=http://127.0.0.1:${API_PORT} pnpm exec vite --port ${WEB_PORT} --strictPort`,
+      url: `http://localhost:${WEB_PORT}`,
       reuseExistingServer: reuse,
       timeout: 60_000,
     },

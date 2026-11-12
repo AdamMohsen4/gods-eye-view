@@ -7,7 +7,7 @@
  * carries only the panorama id and a heading.
  */
 import { randomBytes } from 'node:crypto';
-import { and, asc, desc, eq, inArray, notInArray, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNotNull, notInArray, sql } from 'drizzle-orm';
 import {
   challenges,
   gameRounds,
@@ -50,6 +50,7 @@ import {
   type MapSummary,
   type MeResponse,
   type ProfileStats,
+  badgeProgress,
   type RevealedRound,
 } from '@earthnow/shared';
 import type { Config } from './config.ts';
@@ -187,6 +188,11 @@ export class Game {
         FROM locations WHERE provider = ${this.config.provider} AND NOT disabled
         AND map_id IN (${sql.join(ids.map((i) => sql`${i}::uuid`), sql`, `)}) GROUP BY map_id`),
     );
+    const cc = rowsOf<{ map_id: string; country: string }>(
+      await this.db.execute(sql`SELECT DISTINCT map_id, country FROM locations
+        WHERE provider = ${this.config.provider} AND NOT disabled AND country IS NOT NULL
+        AND map_id IN (${sql.join(ids.map((i) => sql`${i}::uuid`), sql`, `)})`),
+    );
     const plays = rowsOf<{ map_id: string; n: number }>(
       await this.db.execute(sql`SELECT map_id, count(*)::int AS n FROM games
         WHERE map_id IN (${sql.join(ids.map((i) => sql`${i}::uuid`), sql`, `)}) GROUP BY map_id`),
@@ -206,6 +212,8 @@ export class Game {
         locationCount: c?.n ?? 0,
         scaleKm: Math.round(Math.max(50, Math.min(18_000, scale))),
         plays: plays.find((x) => x.map_id === m.id)?.n ?? 0,
+        countries: cc.filter((x) => x.map_id === m.id).map((x) => x.country).sort(),
+        bounds: c && c.n ? ([c.min_lon, c.min_lat, c.max_lon, c.max_lat] as [number, number, number, number]) : null,
       };
     });
   }
@@ -294,7 +302,13 @@ export class Game {
       await this.db.execute(sql`SELECT gr.location_id FROM game_rounds gr JOIN games g ON g.id = gr.game_id
         WHERE g.user_id = ${g.userId} AND g.map_id = ${g.mapId} ORDER BY gr.started_at DESC LIMIT 300`),
     ).map((r) => r.location_id);
-    const base = and(eq(locations.mapId, g.mapId), eq(locations.provider, g.provider), eq(locations.disabled, false));
+    // Streak rounds need a known country, or no guess could ever be right.
+    const base = and(
+      eq(locations.mapId, g.mapId),
+      eq(locations.provider, g.provider),
+      eq(locations.disabled, false),
+      g.mode === 'streak' ? isNotNull(locations.country) : undefined,
+    );
     for (const avoid of [[...new Set([...used, ...recent])], used]) {
       const where = avoid.length ? and(base, notInArray(locations.id, avoid)) : base;
       const [loc] = await this.db.select().from(locations).where(where).orderBy(sql`random()`).limit(1);
@@ -355,24 +369,28 @@ export class Game {
       finished = r.idx + 1 >= g.settings.rounds;
     }
 
-    const [updated] = await this.db
-      .update(gameRounds)
-      .set({ guessLat: guess?.lat ?? null, guessLon: guess?.lon ?? null, guessCountry, guessedAt: now, distanceKm, score, timedOut: !guess })
-      .where(and(eq(gameRounds.gameId, g.id), eq(gameRounds.idx, r.idx), sql`guessed_at IS NULL`))
-      .returning();
-    if (!updated) throw new GameError(409, 'already_guessed');
-
     const totalScore = g.totalScore + score;
-    await this.db
-      .update(games)
-      .set({
-        totalScore,
-        totalDistanceKm: g.totalDistanceKm + (distanceKm ?? 20_000),
-        streak,
-        status: finished ? 'finished' : 'active',
-        finishedAt: finished ? now : null,
-      })
-      .where(eq(games.id, g.id));
+    // One transaction, so /next (which re-reads the game status after the rounds)
+    // can never see the round guessed but the game still active.
+    const updated = await this.db.transaction(async (tx) => {
+      const [row] = await tx
+        .update(gameRounds)
+        .set({ guessLat: guess?.lat ?? null, guessLon: guess?.lon ?? null, guessCountry, guessedAt: now, distanceKm, score, timedOut: !guess })
+        .where(and(eq(gameRounds.gameId, g.id), eq(gameRounds.idx, r.idx), sql`guessed_at IS NULL`))
+        .returning();
+      if (!row) throw new GameError(409, 'already_guessed');
+      await tx
+        .update(games)
+        .set({
+          totalScore,
+          totalDistanceKm: g.totalDistanceKm + (distanceKm ?? 20_000),
+          streak,
+          status: finished ? 'finished' : 'active',
+          finishedAt: finished ? now : null,
+        })
+        .where(eq(games.id, g.id));
+      return row;
+    });
     const xp = g.mode === 'streak' ? (streak > g.streak ? 10 : 0) : xpForRound(score);
     if (xp) await this.db.update(users).set({ xp: sql`${users.xp} + ${xp}` }).where(eq(users.id, user.id));
     if (finished && g.challengeId) await this.afterChallenge(user, g.challengeId);
@@ -386,11 +404,18 @@ export class Game {
     if (g.status !== 'active') throw new GameError(409, 'game_finished');
     const rs = await this.db.select().from(gameRounds).where(eq(gameRounds.gameId, g.id)).orderBy(asc(gameRounds.idx));
     if (rs.some((r) => !r.guessedAt)) return this.stateOf(g);
+    // Re-read after the rounds: a guess that just finished the game commits both together.
+    const [fresh] = await this.db.select().from(games).where(eq(games.id, g.id));
+    if (!fresh || fresh.status !== 'active') return this.stateOf(fresh ?? g);
     const idx = rs.length;
+    const max = g.mode === 'streak' ? STREAK_MAX_ROUNDS : g.settings.rounds;
+    if (idx >= max) return this.stateOf(fresh);
     let locationId: string;
     if (g.challengeId) {
       const [c] = await this.db.select().from(challenges).where(eq(challenges.id, g.challengeId));
-      locationId = c!.locationIds[idx]!;
+      const id = c?.locationIds[idx];
+      if (!id) return this.stateOf(fresh);
+      locationId = id;
     } else {
       locationId = (await this.pickLocation(g, rs.map((r) => r.locationId))).id;
     }
@@ -464,7 +489,8 @@ export class Game {
     const [c] = await this.db.select().from(challenges).where(eq(challenges.id, challengeId));
     if (!c?.dailyDate) return;
     const fresh = (await this.userById(user.id))!;
-    if (fresh.lastDaily === c.dailyDate) return;
+    // Finishing an older daily late must not rewind or reset the streak.
+    if (fresh.lastDaily && fresh.lastDaily >= c.dailyDate) return;
     const current = fresh.lastDaily === addDays(c.dailyDate, -1) ? fresh.dailyStreak + 1 : 1;
     await this.db
       .update(users)
@@ -542,6 +568,7 @@ export class Game {
       await this.db.execute(sql`SELECT g.user_id, u.display_name, u.country, ${metric}::int AS best
         FROM games g JOIN users u ON u.id = g.user_id
         WHERE g.map_id = ${map.id} AND g.mode = ${mode === 'streak' ? 'streak' : 'classic'} AND g.status = 'finished' AND NOT u.banned
+          AND u.id IS DISTINCT FROM ${map.creatorId} -- a map's maker knows every answer
         GROUP BY g.user_id, u.display_name, u.country ORDER BY best DESC LIMIT 50`),
     );
     return rows.map((r, i) => ({ rank: i + 1, userId: r.user_id, displayName: r.display_name, country: r.country, score: r.best, distanceKm: null }));
@@ -584,7 +611,27 @@ export class Game {
         WHERE g.user_id = ${user.id} AND gr.guessed_at IS NOT NULL AND g.mode <> 'streak' AND l.country IS NOT NULL
         GROUP BY l.country ORDER BY n DESC LIMIT 40`),
     );
+    const [extra] = rowsOf<{ countries: number; maps: number; matches: number }>(
+      await this.db.execute(sql`SELECT
+        (SELECT count(DISTINCT l.country)::int FROM game_rounds gr JOIN games g ON g.id = gr.game_id JOIN locations l ON l.id = gr.location_id
+          WHERE g.user_id = ${user.id} AND gr.guessed_at IS NOT NULL AND l.country IS NOT NULL) AS countries,
+        (SELECT count(*)::int FROM maps WHERE creator_id = ${user.id} AND published) AS maps,
+        (SELECT count(*)::int FROM match_players WHERE user_id = ${user.id}) AS matches`),
+    );
+    const badges = badgeProgress({
+      gamesFinished: agg?.games ?? 0,
+      perfectRounds: rounds?.perfect ?? 0,
+      bestGame: agg?.best ?? 0,
+      countriesPlayed: extra?.countries ?? 0,
+      bestStreak: agg?.best_streak ?? 0,
+      bestDailyStreak: user.dailyBest,
+      duelsWon: duels?.won ?? 0,
+      rating: user.rating,
+      mapsPublished: extra?.maps ?? 0,
+      matchesPlayed: extra?.matches ?? 0,
+    });
     return {
+      badges,
       gamesPlayed: agg?.games ?? 0,
       roundsPlayed: rounds?.n ?? 0,
       averageScore: Math.round(rounds?.avg ?? 0),

@@ -1,5 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { MOVE_MODES, TIME_LIMITS, type GameSettings, type MoveMode } from '@earthnow/shared';
+import { serverNow } from '../hub.ts';
+import { IconInfinity } from './icons.tsx';
 
 export const MOVE_LABEL: Record<MoveMode, { short: string; long: string }> = {
   move: { short: 'Moving', long: 'Walk around, pan and zoom' },
@@ -18,6 +20,11 @@ export function settingsLine(s: GameSettings): string {
 
 export function fmt(n: number): string {
   return n.toLocaleString('en-US');
+}
+
+/** "1 play", "2,000 plays". Pass `many` for irregular plurals. */
+export function plural(n: number, one: string, many = `${one}s`): string {
+  return `${fmt(n)} ${n === 1 ? one : many}`;
 }
 
 const regionNames = typeof Intl !== 'undefined' && 'DisplayNames' in Intl ? new Intl.DisplayNames(['en'], { type: 'region' }) : null;
@@ -94,7 +101,7 @@ export function SettingsPicker({ value, onChange, disabled }: { value: GameSetti
           label="Time per round"
           value={value.timeLimit}
           disabled={disabled}
-          options={TIME_LIMITS.map((t) => ({ value: t, label: t ? timeLabel(t) : '∞' }))}
+          options={TIME_LIMITS.map((t) => ({ value: t, label: t ? timeLabel(t) : <><IconInfinity size={18} /><span className="sr-only">No limit</span></>, hint: t ? undefined : 'No time limit' }))}
           onChange={(timeLimit) => onChange({ ...value, timeLimit })}
         />
       </div>
@@ -103,7 +110,8 @@ export function SettingsPicker({ value, onChange, disabled }: { value: GameSetti
 }
 
 /** Seconds left until `deadline` (ISO), ticking. Null when untimed. */
-export function useCountdown(deadline: string | null, now: () => number = Date.now): number | null {
+/** Seconds left until a server deadline, measured on the server's clock. */
+export function useCountdown(deadline: string | null, now: () => number = serverNow): number | null {
   const [left, setLeft] = useState<number | null>(null);
   useEffect(() => {
     if (!deadline) {

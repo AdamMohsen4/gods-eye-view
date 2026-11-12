@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import maplibregl from 'maplibre-gl';
-import 'maplibre-gl/dist/maplibre-gl.css';
 import type { EditableMap } from '@earthnow/shared';
 import { api, errorText } from '../api.ts';
 import { mapStyle } from '../map/style.ts';
 import { pinEl } from '../map/pins.ts';
 import { fmt, useTitle } from '../components/ui.tsx';
+import { IconArrowLeft } from '../components/icons.tsx';
 
 export function MakerList() {
   useTitle('Map maker');
@@ -28,7 +28,6 @@ export function MakerList() {
   }
   return (
     <div className="page narrow">
-      <p className="eyebrow">Map maker</p>
       <h1 className="display">Make your own map</h1>
       <p className="lead">Click anywhere on a map and we’ll find the nearest street-level panorama. Publish once you have five or more places, and anyone can play it.</p>
       <form className="panel form row" onSubmit={create}>
@@ -70,6 +69,8 @@ export function MakerEdit() {
   const [pending, setPending] = useState(0);
   const el = useRef<HTMLDivElement>(null);
   const gl = useRef<maplibregl.Map | null>(null);
+  const [glReady, setGlReady] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const markers = useRef(new Map<string, maplibregl.Marker>());
   const mapRef = useRef<EditableMap | null>(null);
   mapRef.current = map;
@@ -107,12 +108,14 @@ export function MakerEdit() {
         }
       });
       gl.current = m;
+      setGlReady(true);
     });
     return () => {
       cancelled = true;
       m?.remove();
       gl.current = null;
       markers.current.clear();
+      setGlReady(false);
     };
   }, []);
 
@@ -133,12 +136,16 @@ export function MakerEdit() {
       elx.title = 'Remove this place';
       elx.addEventListener('click', async (ev) => {
         ev.stopPropagation();
-        await api.maker.removeLocation(map.id, l.id);
-        setMap((cur) => (cur ? { ...cur, locations: cur.locations.filter((x) => x.id !== l.id) } : cur));
+        try {
+          await api.maker.removeLocation(map.id, l.id);
+          setMap((cur) => (cur ? { ...cur, locations: cur.locations.filter((x) => x.id !== l.id) } : cur));
+        } catch (err) {
+          setNote(errorText(err));
+        }
       });
       markers.current.set(l.id, new maplibregl.Marker({ element: elx, anchor: 'bottom' }).setLngLat([l.lon, l.lat]).addTo(m));
     }
-  }, [map]);
+  }, [map, glReady]);
 
   async function save(patch: { name?: string; description?: string; published?: boolean }) {
     try {
@@ -154,8 +161,8 @@ export function MakerEdit() {
     <div className="maker">
       <div ref={el} className="maker-map" data-testid="maker-map" />
       <aside className="maker-panel">
-        <Link to="/create" className="muted small">
-          ← Your maps
+        <Link to="/create" className="back-link">
+          <IconArrowLeft size={16} /> Your maps
         </Link>
         {map && (
           <>
@@ -186,16 +193,32 @@ export function MakerEdit() {
                   {map.locations.length < 5 ? `Add ${5 - map.locations.length} more to publish` : 'Publish'}
                 </button>
               )}
-              <button
-                type="button"
-                className="btn btn-ghost"
-                onClick={async () => {
-                  await api.maker.remove(map.id);
-                  nav('/create');
-                }}
-              >
-                Delete map
-              </button>
+              {confirmDelete ? (
+                <>
+                  <button
+                    type="button"
+                    className="btn btn-danger"
+                    onClick={async () => {
+                      try {
+                        await api.maker.remove(map.id);
+                        nav('/create');
+                      } catch (e) {
+                        setNote(errorText(e));
+                        setConfirmDelete(false);
+                      }
+                    }}
+                  >
+                    Delete for good
+                  </button>
+                  <button type="button" className="btn btn-ghost" onClick={() => setConfirmDelete(false)}>
+                    Keep it
+                  </button>
+                </>
+              ) : (
+                <button type="button" className="btn btn-ghost" onClick={() => setConfirmDelete(true)}>
+                  Delete map
+                </button>
+              )}
             </div>
           </>
         )}

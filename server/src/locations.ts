@@ -7,6 +7,7 @@ import { createRequire } from 'node:module';
 import { destination, type LatLon } from '@earthnow/shared';
 import { countryAt } from './countries.ts';
 import type { FoundPano, ImageryProvider } from './imagery/index.ts';
+import { ImageryError } from './imagery/types.ts';
 import type { MapDef } from './catalog.ts';
 
 const require = createRequire(import.meta.url);
@@ -63,6 +64,31 @@ export interface GeneratedLocation extends FoundPano {
   heading: number;
 }
 
+let consecutiveFailures = 0;
+
+/**
+ * findPano with backoff for rate limits and server errors. Auth and request
+ * errors stop the run; a long streak of failures does too, rather than
+ * silently reporting "no coverage" for a whole map.
+ */
+async function findWithRetry(provider: ImageryProvider, p: LatLon, radiusM: number): Promise<FoundPano | null> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const found = await provider.findPano(p, radiusM);
+      consecutiveFailures = 0;
+      return found;
+    } catch (e) {
+      if (!(e instanceof ImageryError) || e.kind !== 'retryable') throw e;
+      if (attempt >= 3) {
+        if (++consecutiveFailures >= 20) throw new Error(`${provider.id}: giving up after repeated failures (last: ${e.message})`);
+        console.warn(`[locations] skipping a point: ${e.message}`);
+        return null;
+      }
+      await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
+    }
+  }
+}
+
 /** Find up to `count` panoramas for a map. Calls `onFound` as it goes. */
 export async function generateLocations(
   def: Pick<MapDef, 'countries' | 'minPopulation' | 'radiusKm'>,
@@ -71,20 +97,19 @@ export async function generateLocations(
   opts: { rnd?: () => number; maxAttempts?: number; concurrency?: number; onFound?: (l: GeneratedLocation) => Promise<void> | void; exclude?: Set<string> } = {},
 ): Promise<GeneratedLocation[]> {
   const rnd = opts.rnd ?? Math.random;
+  consecutiveFailures = 0;
   const maxAttempts = opts.maxAttempts ?? count * 25;
   const seen = new Set(opts.exclude ?? []);
   const out: GeneratedLocation[] = [];
   let attempts = 0;
-  const radiusM = def.radiusKm ? 300 : 1000;
+  // Mapillary 360° coverage is sparse, so snap from further away (its tile search makes that cheap).
+  const radiusM = provider.id === 'mapillary' ? (def.radiusKm ? 1500 : 5000) : def.radiusKm ? 300 : 1000;
   const worker = async () => {
     while (out.length < count && attempts < maxAttempts) {
       attempts++;
       const cand = candidatePoint(def, rnd);
       if (!cand) return;
-      const found = await provider.findPano(cand.point, radiusM).catch((e: Error) => {
-        if (/token|denied|key/i.test(e.message)) throw e;
-        return null;
-      });
+      const found = await findWithRetry(provider, cand.point, radiusM);
       if (!found || seen.has(found.panoId)) continue;
       const country = countryAt(found);
       if (country !== cand.country) continue;

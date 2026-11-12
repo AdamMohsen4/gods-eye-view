@@ -21,7 +21,14 @@ export function LeaderboardsPage() {
     void api.maps().then(setMaps).catch(() => {});
   }, []);
   useEffect(() => {
-    void api.mapLeaderboard(slug, mode).then(setRows).catch(() => setRows([]));
+    let live = true; // quick toggles: never let an older answer overwrite a newer one
+    void api
+      .mapLeaderboard(slug, mode)
+      .then((r) => live && setRows(r))
+      .catch(() => live && setRows([]));
+    return () => {
+      live = false;
+    };
   }, [slug, mode]);
 
   return (

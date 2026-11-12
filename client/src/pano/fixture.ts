@@ -117,7 +117,8 @@ export const mountFixture: PanoMount = async (el, { pano, move, onReady }) => {
   const onMove = (e: PointerEvent) => {
     if (!drag) return;
     yaw = drag.yaw - ((e.clientX - drag.x) * 1.4) / zoom;
-    pitch = drag.pitch - (e.clientY - drag.y) / zoom;
+    // The strip is only so tall; clamp so dragging back responds immediately.
+    pitch = Math.max(-H / 2, Math.min(H / 2, drag.pitch - (e.clientY - drag.y) / zoom));
     draw();
   };
   const onUp = () => (drag = null);
@@ -130,6 +131,7 @@ export const mountFixture: PanoMount = async (el, { pano, move, onReady }) => {
   canvas.addEventListener('pointerdown', onDown);
   canvas.addEventListener('pointermove', onMove);
   canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
   canvas.addEventListener('wheel', onWheel, { passive: false });
   const ro = new ResizeObserver(draw);
   ro.observe(el);

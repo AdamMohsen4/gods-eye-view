@@ -1,3 +1,4 @@
+import type { BadgeProgress } from './badges.ts';
 /** Street-level imagery sources. `fixture` is a generated stand-in for dev and tests. */
 export const PROVIDERS = ['mapillary', 'google', 'fixture'] as const;
 export type Provider = (typeof PROVIDERS)[number];
@@ -44,6 +45,10 @@ export interface MapSummary {
   locationCount: number;
   scaleKm: number;
   plays: number;
+  /** ISO 3166-1 alpha-2 codes of the countries the map's places are in. */
+  countries: string[];
+  /** [minLon, minLat, maxLon, maxLat] of the map's places, or null without places. */
+  bounds: [number, number, number, number] | null;
 }
 
 export interface CountryRef {
@@ -149,6 +154,7 @@ export interface ProfileStats {
   duels: { played: number; won: number; rating: number };
   recent: { gameId: string; mode: GameMode; mapName: string; score: number; streak: number; finishedAt: string }[];
   countries: { code: string; name: string; rounds: number; averageScore: number }[];
+  badges: BadgeProgress[];
 }
 
 export interface PublicConfig {
@@ -166,4 +172,20 @@ export interface EditableMap {
   description: string;
   published: boolean;
   locations: { id: string; lat: number; lon: number; country: string | null }[];
+}
+
+export interface FriendView {
+  id: string;
+  name: string;
+  country: string | null;
+  level: number;
+  online: boolean;
+  /** friend: accepted; incoming: they asked you; outgoing: you asked them. */
+  status: 'friend' | 'incoming' | 'outgoing';
+}
+
+export interface FriendsInfo {
+  /** Your code, to give to friends. */
+  code: string;
+  friends: FriendView[];
 }

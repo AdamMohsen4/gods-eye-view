@@ -1,6 +1,5 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import maplibregl from 'maplibre-gl';
-import 'maplibre-gl/dist/maplibre-gl.css';
 import type { LatLon } from '@earthnow/shared';
 import { mapStyle } from './style.ts';
 import { pinEl } from './pins.ts';
@@ -14,6 +13,8 @@ export function GuessMap({ pin, onPin, disabled, resizeKey }: { pin: LatLon | nu
   onPinRef.current = onPin;
   const disabledRef = useRef(disabled);
   disabledRef.current = disabled;
+  // The map is created asynchronously; a pin set before that must still show.
+  const [ready, setReady] = useState(false);
 
   useEffect(() => {
     let m: maplibregl.Map | null = null;
@@ -32,17 +33,29 @@ export function GuessMap({ pin, onPin, disabled, resizeKey }: { pin: LatLon | nu
         renderWorldCopies: true,
       });
       m.touchZoomRotate.disableRotation();
-      m.on('click', (e) => {
+      const drop = (lng: number, lat: number) => {
         if (disabledRef.current) return;
-        onPinRef.current({ lat: e.lngLat.lat, lon: ((((e.lngLat.lng + 180) % 360) + 360) % 360) - 180 });
+        onPinRef.current({ lat, lon: ((((lng + 180) % 360) + 360) % 360) - 180 });
+      };
+      m.on('click', (e) => drop(e.lngLat.lng, e.lngLat.lat));
+      // Keyboard play: arrows pan and +/- zoom (MapLibre), Enter drops the pin at the centre.
+      m.getCanvas().setAttribute('aria-label', 'Guess map. Arrow keys move, plus and minus zoom, Enter drops your pin at the centre.');
+      m.getCanvas().addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        e.stopPropagation();
+        const c = m!.getCenter();
+        drop(c.lng, c.lat);
       });
       map.current = m;
+      setReady(true);
     });
     return () => {
       cancelled = true;
       m?.remove();
       map.current = null;
       marker.current = null;
+      setReady(false);
     };
   }, []);
 
@@ -56,7 +69,7 @@ export function GuessMap({ pin, onPin, disabled, resizeKey }: { pin: LatLon | nu
     }
     if (!marker.current) marker.current = new maplibregl.Marker({ element: pinEl('guess'), anchor: 'bottom' }).setLngLat([pin.lon, pin.lat]).addTo(m);
     else marker.current.setLngLat([pin.lon, pin.lat]);
-  }, [pin]);
+  }, [pin, ready]);
 
   useEffect(() => {
     const id = setTimeout(() => map.current?.resize(), 220);

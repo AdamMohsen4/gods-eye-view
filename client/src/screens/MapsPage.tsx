@@ -1,22 +1,29 @@
 import { useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { DEFAULT_SETTINGS, type GameSettings, type LeaderboardRow, type MapSummary } from '@earthnow/shared';
+import { DEFAULT_SETTINGS, MOVE_MODES, TIME_LIMITS, type GameSettings, type LeaderboardRow, type MapSummary } from '@earthnow/shared';
 import { api, errorText } from '../api.ts';
-import { Segmented, SettingsPicker, copy, fmt, useTitle } from '../components/ui.tsx';
+import { Segmented, SettingsPicker, copy, countryLabel, fmt, plural, useTitle } from '../components/ui.tsx';
+import { MapShape } from '../components/MapShape.tsx';
+import { IconPlus } from '../components/icons.tsx';
 import { Board } from './ChallengePage.tsx';
 
-function sizeLabel(km: number): string {
-  return km >= 10000 ? 'Global' : km >= 3000 ? 'Continental' : km >= 800 ? 'Country' : 'Regional';
+function sizeLabel(map: MapSummary): string {
+  if (map.countries.length === 1) return countryLabel(map.countries[0]);
+  const span = map.bounds ? map.bounds[2] - map.bounds[0] : 360;
+  return span > 200 ? 'Worldwide' : `${map.countries.length} countries`;
 }
 
 export function MapCard({ map }: { map: MapSummary }) {
+  const by = map.kind === 'community' ? `By ${map.creatorName ?? 'someone'}` : sizeLabel(map);
   return (
     <Link to={`/maps/${map.slug}`} className="map-card">
-      <span className="map-card-kind">{map.kind === 'community' ? `by ${map.creatorName ?? 'someone'}` : sizeLabel(map.scaleKm)}</span>
-      <strong>{map.name}</strong>
-      <span className="map-card-desc">{map.description}</span>
-      <span className="map-card-meta">
-        {fmt(map.locationCount)} places · {fmt(map.plays)} plays
+      <MapShape countries={map.countries} bounds={map.bounds} width={320} height={150} />
+      <span className="map-card-body">
+        <strong>{map.name}</strong>
+        <span className="map-card-desc">{map.description}</span>
+        <span className="map-card-meta">
+          {by} · {plural(map.locationCount, 'place')} · {plural(map.plays, 'play')}
+        </span>
       </span>
     </Link>
   );
@@ -37,7 +44,7 @@ export function MapsPage() {
       <div className="section-head">
         <h1 className="display-sm">Maps</h1>
         <Link to="/create" className="btn">
-          Make a map
+          <IconPlus size={18} /> Make a map
         </Link>
       </div>
       <div className="toolbar">
@@ -73,7 +80,12 @@ export function MapPage() {
   const [map, setMap] = useState<MapSummary | null>(null);
   const [settings, setSettings] = useState<GameSettings>(() => {
     try {
-      return { ...DEFAULT_SETTINGS, ...(JSON.parse(localStorage.getItem('earthnow.settings') ?? '{}') as Partial<GameSettings>), rounds: 5 };
+      const saved = JSON.parse(localStorage.getItem('earthnow.settings') ?? '{}') as Partial<GameSettings>;
+      return {
+        move: MOVE_MODES.includes(saved.move as never) ? saved.move! : DEFAULT_SETTINGS.move,
+        timeLimit: TIME_LIMITS.includes(saved.timeLimit as never) ? saved.timeLimit! : DEFAULT_SETTINGS.timeLimit,
+        rounds: 5,
+      };
     } catch {
       return DEFAULT_SETTINGS;
     }
@@ -86,10 +98,24 @@ export function MapPage() {
   useTitle(map?.name ?? 'Map');
 
   useEffect(() => {
-    void api.map(slug!).then(setMap).catch((e) => setError(errorText(e)));
+    let live = true;
+    void api
+      .map(slug!)
+      .then((m) => live && setMap(m))
+      .catch((e) => live && setError(errorText(e)));
+    return () => {
+      live = false;
+    };
   }, [slug]);
   useEffect(() => {
-    void api.mapLeaderboard(slug!, board).then(setRows).catch(() => setRows([]));
+    let live = true;
+    void api
+      .mapLeaderboard(slug!, board)
+      .then((r) => live && setRows(r))
+      .catch(() => live && setRows([]));
+    return () => {
+      live = false;
+    };
   }, [slug, board]);
   useEffect(() => {
     try {
@@ -132,11 +158,13 @@ export function MapPage() {
   return (
     <div className="page map-page">
       <div>
-        <p className="eyebrow">{map.kind === 'community' ? `Community map by ${map.creatorName ?? 'someone'}` : 'Official map'}</p>
         <h1 className="display">{map.name}</h1>
         <p className="lead">{map.description}</p>
-        <p className="muted">
-          {fmt(map.locationCount)} places · about {fmt(map.scaleKm)} km across · {fmt(map.plays)} plays
+        <p className="facts">
+          <span>{map.kind === 'community' ? `Community map by ${map.creatorName ?? 'someone'}` : 'Official map'}</span>
+          <span>{plural(map.locationCount, 'place')}</span>
+          <span>about {fmt(map.scaleKm)} km across</span>
+          <span>{plural(map.plays, 'play')}</span>
         </p>
         <div className="panel">
           <SettingsPicker value={settings} onChange={setSettings} />
@@ -144,10 +172,10 @@ export function MapPage() {
             <button type="button" className="btn btn-primary btn-lg" disabled={busy} onClick={() => void start('classic')} data-testid="play-map">
               Play 5 rounds
             </button>
-            <button type="button" className="btn" disabled={busy} onClick={() => void start('streak')}>
+            <button type="button" className="btn btn-lg" disabled={busy} onClick={() => void start('streak')}>
               Country streak
             </button>
-            <button type="button" className="btn" onClick={() => void challenge()}>
+            <button type="button" className="btn btn-lg btn-ghost" onClick={() => void challenge()}>
               Challenge a friend
             </button>
           </div>
@@ -159,20 +187,26 @@ export function MapPage() {
           {error && <p role="alert">{error}</p>}
         </div>
       </div>
-      <aside className="panel">
-        <div className="section-head">
-          <h3>Best on this map</h3>
-          <Segmented
-            label="Leaderboard"
-            value={board}
-            onChange={setBoard}
-            options={[
-              { value: 'classic', label: 'Score' },
-              { value: 'streak', label: 'Streak' },
-            ]}
-          />
-        </div>
-        <Board rows={rows} />
+      <aside className="map-aside">
+        <figure className="map-hero">
+          <MapShape countries={map.countries} bounds={map.bounds} width={520} height={300} label={`Where ${map.name} takes you: ${plural(map.countries.length, 'country', 'countries')}`} />
+          <figcaption>{map.countries.length === 1 ? countryLabel(map.countries[0]) : plural(map.countries.length, 'country', 'countries')}</figcaption>
+        </figure>
+        <section className="panel">
+          <div className="section-head">
+            <h3>Best on this map</h3>
+            <Segmented
+              label="Leaderboard"
+              value={board}
+              onChange={setBoard}
+              options={[
+                { value: 'classic', label: 'Score' },
+                { value: 'streak', label: 'Streak' },
+              ]}
+            />
+          </div>
+          <Board rows={rows} />
+        </section>
       </aside>
     </div>
   );

@@ -5,3 +5,4 @@ export * from './dates.ts';
 export * from './random.ts';
 export * from './share.ts';
 export * from './multiplayer.ts';
+export * from './badges.ts';

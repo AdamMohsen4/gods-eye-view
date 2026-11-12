@@ -198,3 +198,242 @@ describe('profile', () => {
     expect((await call('DELETE', '/api/me', g)).status).toBe(204);
   });
 });
+
+describe('daily streak edge cases', () => {
+  it('finishing an older daily late does not reset the streak', async () => {
+    const g = guest();
+    const day1 = new Date('2026-11-20T12:00:00Z');
+    const day2 = new Date('2026-11-21T12:00:00Z');
+    const saved = clock;
+    try {
+      clock = day1;
+      const old = (await call('GET', '/api/daily', g)).body!;
+      let s1 = (await call('POST', `/api/challenges/${old.token}/play`, g)).body!;
+      await call('POST', `/api/games/${s1.id}/guess`, g, { guess: { lat: 10, lon: 10 } });
+      s1 = (await call('POST', `/api/games/${s1.id}/next`, g)).body!;
+      clock = day2;
+      const today = (await call('GET', '/api/daily', g)).body!;
+      let s2 = (await call('POST', `/api/challenges/${today.token}/play`, g)).body!;
+      for (let r = 0; r < 5; r++) {
+        await call('POST', `/api/games/${s2.id}/guess`, g, { guess: { lat: 10, lon: 10 } });
+        if (r < 4) s2 = (await call('POST', `/api/games/${s2.id}/next`, g)).body!;
+      }
+      // Now finish yesterday's.
+      for (let r = 1; r < 5; r++) {
+        await call('POST', `/api/games/${s1.id}/guess`, g, { guess: { lat: 10, lon: 10 } });
+        if (r < 4) s1 = (await call('POST', `/api/games/${s1.id}/next`, g)).body!;
+      }
+      const me = (await call('GET', '/api/me', g)).body!;
+      expect(me.dailyStreak.playedToday).toBe(true);
+      expect(me.dailyStreak.current).toBe(1);
+    } finally {
+      clock = saved;
+    }
+  });
+
+  it('next never opens a round past the end, even when raced with the last guess', async () => {
+    const g = guest();
+    let s = (await call('POST', '/api/games', g, { mapSlug: 'world' })).body!;
+    for (let r = 0; r < 4; r++) {
+      await call('POST', `/api/games/${s.id}/guess`, g, { guess: { lat: 0, lon: 0 } });
+      s = (await call('POST', `/api/games/${s.id}/next`, g)).body!;
+    }
+    const [, n] = await Promise.all([
+      call('POST', `/api/games/${s.id}/guess`, g, { guess: { lat: 0, lon: 0 } }),
+      call('POST', `/api/games/${s.id}/next`, g),
+    ]);
+    expect([200, 409]).toContain(n.status);
+    s = (await call('GET', `/api/games/${s.id}`, g)).body!;
+    expect(s.status).toBe('finished');
+    expect(s.rounds).toHaveLength(5);
+    expect(s.current).toBeNull();
+  });
+});
+
+describe('realtime hub', () => {
+  type Msg = Record<string, any>;
+  function sock() {
+    const inbox: Msg[] = [];
+    const socket = { send: (d: string) => inbox.push(JSON.parse(d)), close: () => {} };
+    const handle = app.hub.connect(socket);
+    const say = (m: Msg) => handle(JSON.stringify(m));
+    return { socket, inbox, say, last: (t: string) => [...inbox].reverse().find((m) => m.t === t) };
+  }
+
+  it('a second hello on the same socket moves it to the new user', async () => {
+    const s = sock();
+    const a = guest();
+    const b = guest();
+    await s.say({ t: 'hello', guestId: a });
+    const ua = s.last('welcome')!.userId;
+    await s.say({ t: 'hello', guestId: b });
+    expect(app.hub.online(ua)).toBe(false);
+    expect(app.hub.online(s.last('welcome')!.userId)).toBe(true);
+    expect(typeof s.last('welcome')!.now).toBe('number');
+    expect(s.last('welcome')!.matchIds).toEqual([]);
+    app.hub.disconnect(s.socket);
+  });
+
+  it('on hello the client gets full queue and party state', async () => {
+    const s = sock();
+    await s.say({ t: 'hello', guestId: guest() });
+    expect(s.last('queue.status')).toMatchObject({ waiting: false });
+    expect(s.last('party.closed')).toMatchObject({ reason: 'none' });
+    await s.say({ t: 'hello', guestId: 'not-a-uuid-but-36-chars-long-------' });
+    expect(s.last('error')).toMatchObject({ code: 'guest_id_required' });
+    app.hub.disconnect(s.socket);
+  });
+
+  it('two players joining at once can never both get the same waiting opponent', async () => {
+    const [a, b, c] = [sock(), sock(), sock()];
+    for (const s of [a, b, c]) await s.say({ t: 'hello', guestId: guest() });
+    await a.say({ t: 'queue.join', ranked: false });
+    expect(a.last('queue.status')).toMatchObject({ waiting: true });
+    await Promise.all([b.say({ t: 'queue.join', ranked: false }), c.say({ t: 'queue.join', ranked: false })]);
+    const aMatches = a.inbox.filter((m) => m.t === 'match.state').map((m) => m.match.id);
+    expect(new Set(aMatches).size).toBe(1);
+    const inMatch = [b, c].filter((s) => s.inbox.some((m) => m.t === 'match.state'));
+    expect(inMatch).toHaveLength(1);
+    const waiting = [b, c].find((s) => !s.inbox.some((m) => m.t === 'match.state'))!;
+    expect(waiting.last('queue.status')).toMatchObject({ waiting: true });
+    for (const s of [a, b, c]) {
+      const id = s.last('match.state')?.match.id;
+      if (id) await s.say({ t: 'match.leave', matchId: id });
+      await s.say({ t: 'queue.leave' });
+      app.hub.disconnect(s.socket);
+    }
+  });
+
+  it('refuses a party game on a map with fewer places than rounds, and tells a leaver', async () => {
+    const g = guest();
+    const m = (await call('POST', '/api/maker/maps', g, { name: 'Tiny map' })).body!;
+    for (let i = 0; i < 5; i++) await call('POST', `/api/maker/maps/${m.id}/locations`, g, { point: { lat: 60 + i * 0.5, lon: 15 } });
+    await call('PATCH', `/api/maker/maps/${m.id}`, g, { published: true });
+    const s = sock();
+    await s.say({ t: 'hello', guestId: g });
+    await s.say({ t: 'party.create' });
+    await s.say({ t: 'party.settings', settings: { mapSlug: m.slug, rounds: 10 } });
+    await new Promise((r) => setTimeout(r, 50));
+    await s.say({ t: 'party.start' });
+    expect(s.last('error')).toMatchObject({ code: 'map_too_small' });
+    await s.say({ t: 'party.leave' });
+    expect(s.last('party.closed')).toMatchObject({ reason: 'left' });
+    app.hub.disconnect(s.socket);
+  });
+});
+
+describe('friends', () => {
+  it('asks by code, accepts, lists both sides, and removes', async () => {
+    const a = guest();
+    const b = guest();
+    const infoA = (await call('GET', '/api/friends', a)).body!;
+    const infoB = (await call('GET', '/api/friends', b)).body!;
+    expect(infoA.code).toMatch(/^[A-HJ-NP-Z2-9]{6}$/);
+    expect(infoA.code).not.toBe(infoB.code);
+    // The code is stable.
+    expect((await call('GET', '/api/friends', a)).body!.code).toBe(infoA.code);
+
+    expect((await call('POST', '/api/friends', a, { code: 'nope' })).status).toBe(400);
+    expect((await call('POST', '/api/friends', a, { code: 'ZZZZZZ' })).status).toBe(404);
+    expect((await call('POST', '/api/friends', a, { code: infoA.code })).status).toBe(400);
+
+    const sent = (await call('POST', '/api/friends', a, { code: infoB.code.toLowerCase() })).body!;
+    expect(sent.friends).toEqual([expect.objectContaining({ status: 'outgoing', online: false })]);
+    const incoming = (await call('GET', '/api/friends', b)).body!;
+    expect(incoming.friends).toEqual([expect.objectContaining({ status: 'incoming' })]);
+    const bId = sent.friends[0].id as string;
+    const aId = incoming.friends[0].id as string;
+
+    // Only the addressee can accept.
+    expect((await call('POST', `/api/friends/${bId}/accept`, a)).status).toBe(404);
+    const accepted = (await call('POST', `/api/friends/${aId}/accept`, b)).body!;
+    expect(accepted.friends).toEqual([expect.objectContaining({ status: 'friend', id: aId })]);
+    expect((await call('GET', '/api/friends', a)).body!.friends[0].status).toBe('friend');
+
+    const removed = (await call('DELETE', `/api/friends/${aId}`, b)).body!;
+    expect(removed.friends).toEqual([]);
+    expect((await call('GET', '/api/friends', a)).body!.friends).toEqual([]);
+  });
+
+  it('asking someone who already asked you accepts; deleting your data removes the friendship', async () => {
+    const a = guest();
+    const b = guest();
+    const codeA = (await call('GET', '/api/friends', a)).body!.code;
+    const codeB = (await call('GET', '/api/friends', b)).body!.code;
+    await call('POST', '/api/friends', a, { code: codeB });
+    const both = (await call('POST', '/api/friends', b, { code: codeA })).body!;
+    expect(both.friends[0].status).toBe('friend');
+    await call('DELETE', '/api/me', b);
+    expect((await call('GET', '/api/friends', a)).body!.friends).toEqual([]);
+  });
+
+  it('profile stats carry badge progress', async () => {
+    const g = guest();
+    const s = (await call('GET', '/api/me/stats', g)).body!;
+    expect(s.badges.length).toBeGreaterThan(5);
+    expect(s.badges.find((b: any) => b.id === 'first-game')).toMatchObject({ earned: false, progress: 0, goal: 1 });
+  });
+});
+
+describe('realtime: friends, invites and team parties', () => {
+  type Msg = Record<string, any>;
+  const tick = () => new Promise((r) => setTimeout(r, 30));
+  function sock() {
+    const inbox: Msg[] = [];
+    const socket = { send: (d: string) => inbox.push(JSON.parse(d)), close: () => {} };
+    const handle = app.hub.connect(socket);
+    const say = async (m: Msg) => {
+      await handle(JSON.stringify(m));
+      await tick();
+    };
+    return { socket, inbox, say, last: (t: string) => [...inbox].reverse().find((m) => m.t === t) };
+  }
+
+  it('invites only friends who are online, and a teams party starts with two sides', async () => {
+    const ga = guest();
+    const gb = guest();
+    const gc = guest();
+    const codeB = (await call('GET', '/api/friends', gb)).body!.code;
+    const codeA = (await call('GET', '/api/friends', ga)).body!.code;
+    await call('POST', '/api/friends', ga, { code: codeB });
+    await call('POST', '/api/friends', gb, { code: codeA });
+    const [a, b, c] = [sock(), sock(), sock()];
+    await a.say({ t: 'hello', guestId: ga });
+    await b.say({ t: 'hello', guestId: gb });
+    await c.say({ t: 'hello', guestId: gc });
+    const bId = b.last('welcome')!.userId;
+    const cId = c.last('welcome')!.userId;
+
+    // Not in a party yet.
+    await a.say({ t: 'party.invite', userId: bId });
+    expect(a.last('error')).toMatchObject({ code: 'party_not_found' });
+    await a.say({ t: 'party.create' });
+    const code = a.last('party.state')!.party.code;
+    // Not friends with c.
+    await a.say({ t: 'party.invite', userId: cId });
+    expect(a.last('error')).toMatchObject({ code: 'not_friends' });
+    // Friends with b: b gets the invite with the code.
+    await a.say({ t: 'party.invite', userId: bId });
+    expect(b.last('party.invite')).toMatchObject({ code, from: { name: expect.any(String) } });
+    expect(a.last('party.invited')).toMatchObject({ userId: bId });
+
+    // Teams: the second player lands on the other side.
+    await b.say({ t: 'party.join', code });
+    await a.say({ t: 'party.settings', settings: { format: 'teams' } });
+    const players = a.last('party.state')!.party.players as Msg[];
+    expect(new Set(players.map((p) => p.team))).toEqual(new Set([0, 1]));
+    // Both on one side: refused.
+    await b.say({ t: 'party.team', team: 0 });
+    await a.say({ t: 'party.start' });
+    expect(a.last('error')).toMatchObject({ code: 'teams_need_two_sides' });
+    // Only the host moves others.
+    await b.say({ t: 'party.team', team: 1, playerId: a.last('welcome')!.userId });
+    expect(b.last('error')).toMatchObject({ code: 'host_only' });
+    await b.say({ t: 'party.team', team: 1 });
+    await a.say({ t: 'party.start' });
+    const m = a.last('match.state')!.match;
+    expect(m.format).toBe('teams');
+    expect(m.teams).toEqual([{ hp: 5000 }, { hp: 5000 }]);
+    for (const s of [a, b, c]) app.hub.disconnect(s.socket);
+  });
+});

@@ -19,8 +19,7 @@ const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'migr
  * Open the database.
  * - `DATABASE_URL=postgres://…` → postgres-js (production; EU-region Postgres).
  * - `memory://` → in-memory PGlite (tests).
- * - unset → PGlite persisted in <repo>/.data/pg (local dev only; single process,
- *   so the server embeds the worker with EMBED_WORKER=1).
+ * - unset → PGlite persisted in <repo>/.data/pg (local dev only; single process).
  */
 export async function openDb(url = process.env.DATABASE_URL): Promise<DbHandle> {
   let handle: DbHandle;

@@ -3,6 +3,7 @@ import type { CountryRef, LatLon } from '@earthnow/shared';
 import { GuessMap } from '../map/GuessMap.tsx';
 import { api } from '../api.ts';
 import { Flag } from './ui.tsx';
+import { IconClose, IconMinus, IconPin, IconPlus } from './icons.tsx';
 
 type Size = 'sm' | 'md' | 'lg';
 
@@ -29,14 +30,16 @@ export function GuessPanel({
 }) {
   const [size, setSize] = useState<Size>(() => {
     try {
-      return (localStorage.getItem('earthnow.mapSize') as Size) || 'md';
+      const v = localStorage.getItem('earthnow.mapSize');
+      return v === 'sm' || v === 'md' || v === 'lg' ? v : 'md';
     } catch {
       return 'md';
     }
   });
   const [hover, setHover] = useState(false);
   const [sheet, setSheet] = useState(false);
-  const [country, setCountry] = useState<CountryRef | null>(null);
+  /** undefined while the lookup for the current pin is in flight. */
+  const [country, setCountry] = useState<CountryRef | null | undefined>(null);
 
   useEffect(() => {
     try {
@@ -51,13 +54,44 @@ export function GuessPanel({
       setCountry(null);
       return;
     }
-    const id = setTimeout(() => void api.countryAt(pin).then((r) => setCountry(r.country)).catch(() => {}), 150);
-    return () => clearTimeout(id);
+    // Never show the previous pin's country, and ignore answers for an old pin.
+    let live = true;
+    setCountry(undefined);
+    const id = setTimeout(
+      () =>
+        void api
+          .countryAt(pin)
+          .then((r) => live && setCountry(r.country))
+          .catch(() => live && setCountry(null)),
+      150,
+    );
+    return () => {
+      live = false;
+      clearTimeout(id);
+    };
   }, [pin, showCountry]);
 
+  // Escape closes the phone map sheet.
+  useEffect(() => {
+    if (!sheet) return;
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setSheet(false);
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [sheet]);
+
   const effective: Size = hover && size !== 'lg' ? (size === 'sm' ? 'md' : 'lg') : size;
-  const canGuess = !!pin && !busy && !locked;
-  const buttonText = locked ? 'Guessed' : !pin ? 'Place your pin' : showCountry ? (country ? `Guess ${country.name}` : 'Not a country') : label;
+  const canGuess = !!pin && !busy && !locked && !(showCountry && country === undefined);
+  const buttonText = locked
+    ? 'Guessed'
+    : !pin
+      ? 'Place your pin'
+      : showCountry
+        ? country === undefined
+          ? 'Checking…'
+          : country
+            ? `Guess ${country.name}`
+            : 'Not a country'
+        : label;
 
   return (
     <>
@@ -68,13 +102,13 @@ export function GuessPanel({
       >
         <div className="guess-panel-tools">
           <button type="button" className="icon-btn" aria-label="Smaller map" disabled={size === 'sm'} onClick={() => setSize(size === 'lg' ? 'md' : 'sm')}>
-            −
+            <IconMinus size={16} strokeWidth={2} />
           </button>
           <button type="button" className="icon-btn" aria-label="Bigger map" disabled={size === 'lg'} onClick={() => setSize(size === 'sm' ? 'md' : 'lg')}>
-            +
+            <IconPlus size={16} strokeWidth={2} />
           </button>
           <button type="button" className="icon-btn sheet-close" aria-label="Close map" onClick={() => setSheet(false)}>
-            ✕
+            <IconClose size={18} />
           </button>
         </div>
         <GuessMap pin={pin} onPin={onPin} disabled={locked} resizeKey={`${effective}-${sheet}`} />
@@ -83,7 +117,7 @@ export function GuessPanel({
         </button>
       </div>
       <button type="button" className="btn btn-primary map-fab" onClick={() => setSheet(true)} data-testid="open-map">
-        {pin ? (locked ? 'Guessed' : 'Map · pinned') : 'Open map'}
+        <IconPin size={18} /> {pin ? (locked ? 'Guessed' : 'Pinned · map') : 'Open map'}
       </button>
     </>
   );

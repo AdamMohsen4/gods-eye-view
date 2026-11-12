@@ -1,6 +1,8 @@
 import { Suspense, lazy } from 'react';
 import { BrowserRouter, Link, Route, Routes, useLocation } from 'react-router-dom';
-import { Header } from './components/Header.tsx';
+import { Header, TabBar } from './components/Header.tsx';
+import { IconClose } from './components/icons.tsx';
+import { InviteToast } from './components/InviteToast.tsx';
 import { Home } from './screens/Home.tsx';
 import { MapPage, MapsPage } from './screens/MapsPage.tsx';
 import { ChallengePage } from './screens/ChallengePage.tsx';
@@ -23,7 +25,7 @@ function Shell() {
       {!immersive && <Header />}
       {immersive && (
         <Link to="/" className="home-btn btn btn-glass" aria-label="Leave to home">
-          ✕
+          <IconClose />
         </Link>
       )}
       <main>
@@ -45,17 +47,25 @@ function Shell() {
           <Route
             path="*"
             element={
-              <div className="page center">
-                <p>Nothing here.</p>
-                <Link className="btn" to="/">
-                  Home
-                </Link>
+              <div className="page center lost">
+                <h1 className="display-sm">Off the map</h1>
+                <p className="muted">There’s no page at this address. It may have moved, or the link was cut short.</p>
+                <div className="actions">
+                  <Link className="btn btn-primary" to="/">
+                    Back to Earthnow
+                  </Link>
+                  <Link className="btn" to="/maps">
+                    Browse maps
+                  </Link>
+                </div>
               </div>
             }
           />
         </Routes>
         </Suspense>
       </main>
+      {!immersive && <TabBar />}
+      {!/^\/(game|party)/.test(loc.pathname) && <InviteToast />}
     </div>
   );
 }

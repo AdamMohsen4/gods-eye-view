@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { MapSummary, MatchState } from '@earthnow/shared';
 import { Match, type MatchDeps, type MatchLocation, type MatchResult } from './match.ts';
 
-const MAP: MapSummary = { id: 'm', slug: 'world', name: 'World', description: '', kind: 'official', creatorName: null, locationCount: 10, scaleKm: 15000, plays: 0 };
+const MAP: MapSummary = { id: 'm', slug: 'world', name: 'World', description: '', kind: 'official', creatorName: null, locationCount: 10, scaleKm: 15000, plays: 0, countries: [], bounds: null };
 
 function harness() {
   let t = 0;
@@ -145,5 +145,179 @@ describe('party (classic)', () => {
     expect(h.last().phase).toBe('round');
     m.setConnected('b', false);
     expect(h.last().phase).toBe('reveal');
+  });
+});
+
+describe('robustness', () => {
+  const duo = [
+    { id: 'a', name: 'A', country: null, rating: 1000 },
+    { id: 'b', name: 'B', country: null, rating: 1000 },
+  ];
+
+  it('finishes cleanly when the map runs out of places instead of crashing', async () => {
+    const h = harness();
+    let calls = 0;
+    const errors: unknown[] = [];
+    h.deps.pickLocation = async () => {
+      calls++;
+      if (calls > 1) throw new Error('map_exhausted');
+      return { id: 'l1', lat: 1, lon: 1, pano: { provider: 'fixture', panoId: 'p1', heading: 0 }, country: null, credit: null };
+    };
+    h.deps.log = (_m, e) => errors.push(e);
+    const m = new Match('x', 'classic', false, MAP, { move: 'move', timeLimit: 0, rounds: 5 }, duo, h.deps);
+    m.start();
+    await h.advance(5000);
+    m.guess('a', STOCKHOLM);
+    m.guess('b', OSLO);
+    await h.advance(8000);
+    expect(h.last().phase).toBe('finished');
+    expect(h.results).toHaveLength(1);
+    expect(errors).toHaveLength(1);
+  });
+
+  it('a failed save is logged, never thrown, and players still get the result', async () => {
+    const h = harness();
+    const errors: unknown[] = [];
+    h.deps.finish = async () => {
+      throw new Error('fk violation');
+    };
+    h.deps.log = (_m, e) => errors.push(e);
+    const m = new Match('x', 'duel', true, MAP, { move: 'move', timeLimit: 0, rounds: 0 }, duo, h.deps);
+    m.start();
+    await h.advance(5000);
+    m.leave('b');
+    await h.advance(10);
+    expect(h.last().phase).toBe('finished');
+    expect(h.last().result!.winnerId).toBe('a');
+    expect(errors).toHaveLength(1);
+  });
+
+  it('does not come back to life if it ends while a location is being picked', async () => {
+    const h = harness();
+    let release: (() => void) | null = null;
+    h.deps.pickLocation = () =>
+      new Promise((resolve) => {
+        release = () => resolve({ id: 'l1', lat: 1, lon: 1, pano: { provider: 'fixture', panoId: 'p1', heading: 0 }, country: null, credit: null });
+      });
+    const m = new Match('x', 'duel', true, MAP, { move: 'move', timeLimit: 0, rounds: 0 }, duo, h.deps);
+    m.start();
+    await h.advance(5000);
+    m.leave('b');
+    release!();
+    await h.advance(10);
+    expect(h.last().phase).toBe('finished');
+    expect(h.results).toHaveLength(1);
+  });
+
+  it('a duel where both players vanish has no winner and is not ranked', async () => {
+    const h = harness();
+    const m = new Match('x', 'duel', true, MAP, { move: 'move', timeLimit: 0, rounds: 0 }, duo, h.deps);
+    m.start();
+    await h.advance(5000);
+    m.setConnected('a', false);
+    m.setConnected('b', false);
+    await h.advance(46_000);
+    expect(h.last().phase).toBe('finished');
+    expect(h.results[0]!.winnerId).toBeNull();
+    expect(h.results[0]!.ranked).toBe(false);
+  });
+
+  it('a party round without a time limit shows no clock but still ends after the cap', async () => {
+    const h = harness();
+    const m = new Match('x', 'classic', false, MAP, { move: 'move', timeLimit: 0, rounds: 2 }, duo, h.deps);
+    m.start();
+    await h.advance(5000);
+    expect(h.last().round!.endsAt).toBeNull();
+    m.guess('a', STOCKHOLM);
+    await h.advance(601_000 + 2000);
+    expect(h.last().phase).toBe('reveal');
+    expect(h.last().reveal!.guesses.find((g) => g.playerId === 'b')!.guess).toBeNull();
+  });
+});
+
+describe('teams', () => {
+  const players = [
+    { id: 'a', name: 'A', country: null, rating: 1000, team: 0 },
+    { id: 'b', name: 'B', country: null, rating: 1000, team: 0 },
+    { id: 'c', name: 'C', country: null, rating: 1000, team: 1 },
+  ];
+
+  it('scores each side by its best guess and damages the worse side', async () => {
+    const h = harness();
+    const m = new Match('t', 'teams', false, MAP, { move: 'move', timeLimit: 0, rounds: 0 }, players, h.deps);
+    m.start();
+    await h.advance(5000);
+    expect(h.last().teams).toEqual([{ hp: 5000 }, { hp: 5000 }]);
+    m.guess('a', MADRID); // weak
+    m.guess('b', STOCKHOLM); // perfect: team 0's score
+    m.guess('c', OSLO); // close, but worse than b
+    const rev = h.last();
+    expect(rev.phase).toBe('reveal');
+    expect(rev.reveal!.teamDamage![0]).toBe(0);
+    expect(rev.reveal!.teamDamage![1]).toBeGreaterThan(0);
+    expect(rev.teams![1]!.hp).toBe(5000 - rev.reveal!.teamDamage![1]!);
+    expect(JSON.stringify(h.states.filter((s) => s.phase === 'round'))).not.toContain('59.33');
+  });
+
+  it('a side that empties concedes, and its members lose', async () => {
+    const h = harness();
+    const m = new Match('t', 'teams', false, MAP, { move: 'move', timeLimit: 0, rounds: 0 }, players, h.deps);
+    m.start();
+    await h.advance(5000);
+    m.leave('c');
+    await h.advance(10);
+    expect(h.last().phase).toBe('finished');
+    expect(h.last().result!.winnerTeam).toBe(0);
+    expect(h.results[0]!.players.find((p) => p.id === 'a')!.won).toBe(true);
+    expect(h.results[0]!.players.find((p) => p.id === 'c')!.won).toBe(false);
+  });
+
+  it('refuses to start without two sides', () => {
+    const h = harness();
+    expect(() => new Match('t', 'teams', false, MAP, { move: 'move', timeLimit: 0, rounds: 0 }, players.map((p) => ({ ...p, team: 0 })), h.deps)).toThrow('teams_need_two_sides');
+  });
+});
+
+describe('elimination', () => {
+  const players = ['a', 'b', 'c'].map((id) => ({ id, name: id.toUpperCase(), country: null, rating: 1000 }));
+
+  it('the worst guess costs a life; ties for everyone cost nothing; last standing wins', async () => {
+    const h = harness();
+    const m = new Match('e', 'elimination', false, MAP, { move: 'move', timeLimit: 0, rounds: 0 }, players, h.deps);
+    m.start();
+    await h.advance(5000);
+    expect(h.last().players.every((p) => p.lives === 3)).toBe(true);
+    // Everyone equally good: nobody loses a life.
+    for (const id of ['a', 'b', 'c']) m.guess(id, STOCKHOLM);
+    expect(h.last().players.every((p) => p.lives === 3)).toBe(true);
+    // c is worst every round until out, then b is worst until out.
+    const round = async (worst: string) => {
+      await h.advance(8000);
+      for (const p of h.last().players.filter((q) => q.lives > 0)) m.guess(p.id, p.id === worst ? MADRID : STOCKHOLM);
+    };
+    for (let i = 0; i < 3; i++) await round('c');
+    expect(h.last().players.find((p) => p.id === 'c')!.lives).toBe(0);
+    expect(h.last().reveal!.guesses.find((g) => g.playerId === 'c')!.lostLife).toBe(true);
+    // c is out: guessing now is refused.
+    await h.advance(8000);
+    expect(() => m.guess('c', STOCKHOLM)).toThrow('eliminated');
+    m.guess('a', STOCKHOLM);
+    m.guess('b', MADRID);
+    for (let i = 0; i < 2; i++) await round('b');
+    await h.advance(10);
+    expect(h.last().phase).toBe('finished');
+    expect(h.last().result!.winnerId).toBe('a');
+  });
+
+  it('leaving gives up your lives; the last one left wins', async () => {
+    const h = harness();
+    const m = new Match('e', 'elimination', false, MAP, { move: 'move', timeLimit: 0, rounds: 0 }, players, h.deps);
+    m.start();
+    await h.advance(5000);
+    m.leave('b');
+    m.leave('c');
+    await h.advance(10);
+    expect(h.last().phase).toBe('finished');
+    expect(h.last().result!.winnerId).toBe('a');
   });
 });

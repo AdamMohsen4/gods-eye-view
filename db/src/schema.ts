@@ -15,6 +15,7 @@ export const users = pgTable('users', {
   dailyBest: integer('daily_best').notNull().default(0),
   lastDaily: date('last_daily', { mode: 'string' }),
   banned: boolean('banned').notNull().default(false),
+  friendCode: text('friend_code').unique(),
   createdAt: tz('created_at').notNull().defaultNow(),
 });
 
@@ -121,3 +122,14 @@ export type LocationRow = typeof locations.$inferSelect;
 export type ChallengeRow = typeof challenges.$inferSelect;
 export type GameRow = typeof games.$inferSelect;
 export type GameRoundRow = typeof gameRounds.$inferSelect;
+
+export const friendships = pgTable(
+  'friendships',
+  {
+    requesterId: uuid('requester_id').notNull(),
+    addresseeId: uuid('addressee_id').notNull(),
+    status: text('status').$type<'pending' | 'accepted'>().notNull().default('pending'),
+    createdAt: tz('created_at').notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.requesterId, t.addresseeId] })],
+);

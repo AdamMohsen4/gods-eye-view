@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { dailyNumber, duelMultiplier, elo, haversineKm, levelFor, scoreGuess, seededRandom, shareText, spreadKm } from './index.ts';
+import { BADGES, badgeProgress } from './badges.ts';
 
 describe('scoring', () => {
   it('gives 5000 inside 25 m and decays with distance', () => {
@@ -46,5 +47,20 @@ describe('geo + misc', () => {
     const t = shareText({ title: 'Earthnow Daily #3', total: 12000, scores: [5000, 4000, 2000, 1000, 0], url: 'https://x/y' });
     expect(t).toContain('🟩🟨🟧🟥🟥');
     expect(t).toContain('12,000 / 25,000');
+  });
+});
+
+
+describe('badges', () => {
+  it('reports progress capped at the goal and marks earned ones', () => {
+    const zero = { gamesFinished: 0, perfectRounds: 0, bestGame: 0, countriesPlayed: 0, bestStreak: 0, bestDailyStreak: 0, duelsWon: 0, rating: 1000, mapsPublished: 0, matchesPlayed: 0 };
+    const none = badgeProgress(zero);
+    expect(none).toHaveLength(BADGES.length);
+    expect(none.every((b) => !b.earned || b.id === 'contender')).toBe(true);
+    const some = badgeProgress({ ...zero, gamesFinished: 30, countriesPlayed: 40, rating: 1250 });
+    expect(some.find((b) => b.id === 'regular')).toMatchObject({ earned: true, progress: 25, goal: 25 });
+    expect(some.find((b) => b.id === 'atlas')).toMatchObject({ earned: false, progress: 40, goal: 75 });
+    expect(some.find((b) => b.id === 'contender')!.earned).toBe(true);
+    expect(new Set(BADGES.map((b) => b.id)).size).toBe(BADGES.length);
   });
 });

@@ -26,8 +26,11 @@ existing game's name, UI, wording or art.
 | Map maker | Click to add places (snapped to the nearest panorama), publish at ≥ 5 places | ✅ |
 | Profile | Level/XP, stats, recent games, per-country averages, name + country, delete my data | ✅ |
 | Leaderboards | Today's daily, duel rating, best score / best streak per map | ✅ |
-| Accounts (sign-in), Plus subscription | Guest identity only so far | ⏳ deferred |
-| Team duels, battle royale, friends list, badges | — | ⏳ not built |
+| Team duels | Party format: two teams share 5,000 HP; a team's best guess counts; duel damage rules | ✅ |
+| Elimination | Party format (our battle-royale take): 3 lives each, the worst guess of a round costs one, last one standing wins | ✅ |
+| Friends | Friend codes, requests, online presence, invite an online friend to your party | ✅ |
+| Badges | 12 milestones computed from your record (games, perfect rounds, countries, streaks, duels, maps) | ✅ |
+| Accounts (sign-in), Plus subscription | Guest identity only so far; needs Clerk and Stripe accounts (owner decision, costs money) | ⏳ deferred |
 
 ## Scoring
 
@@ -42,8 +45,8 @@ Locations are stored per provider, so `IMAGERY_PROVIDER` switches instantly:
 
 | Provider | Viewer | Location search | Cost | Licence |
 | --- | --- | --- | --- | --- |
-| `mapillary` | mapillary-js (MIT) | Graph API, 360° images only | Free | Imagery CC BY-SA 4.0, credited on reveal |
-| `google` | Maps JS `StreetViewPanorama` | Street View metadata endpoint (no charge) | Dynamic Street View is billed per panorama load | Google Maps Platform terms |
+| `mapillary` | mapillary-js (MIT) | Coverage vector tiles + Graph API, 360° images only | Free | Imagery CC BY-SA 4.0, credited on reveal |
+| `google` | Maps JS `StreetViewPanorama` | Street View metadata endpoint (no charge) | Dynamic Street View is billed per panorama load | Google Maps Platform terms; evaluation-only until ADR-004 is decided (no Street View beside a non-Google map) |
 | `fixture` | Generated canvas | Pre-generated `server/fixtures/locations.json` | — | Dev and tests only |
 
 `pnpm locations:generate -- --provider mapillary` fills the official maps. Candidates are drawn
@@ -70,7 +73,7 @@ client (Vite + React + MapLibre + pano adapter)
 server (Fastify) ── Game (solo) · MapMaker · Hub → Match (duel/party state machine)
    │
    ▼
-Postgres / PGlite: users, maps, locations, challenges, games, game_rounds, matches, match_players
+Postgres / PGlite: users, maps, locations, challenges, games, game_rounds, matches, match_players, friendships
 ```
 
 API contract: `docs/API.md`.

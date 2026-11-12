@@ -1,5 +1,5 @@
 import type { LatLon } from '@earthnow/shared';
-import type { FoundPano, ImageryProvider } from './types.ts';
+import { ImageryError, fetchProvider, type FoundPano, type ImageryProvider } from './types.ts';
 
 /**
  * Google Street View metadata endpoint (no charge per request). Only
@@ -15,8 +15,8 @@ export function googleProvider(key: string, fetchImpl: typeof fetch = fetch): Im
       url.searchParams.set('radius', String(Math.round(radiusM)));
       url.searchParams.set('source', 'outdoor');
       url.searchParams.set('key', key);
-      const res = await fetchImpl(url, { signal: AbortSignal.timeout(15_000) });
-      if (!res.ok) return null;
+      const res = await fetchProvider('google', fetchImpl, url);
+      if (!res.ok) throw new ImageryError(`google: HTTP ${res.status}`, res.status === 429 || res.status >= 500 ? 'retryable' : 'request');
       const body = (await res.json()) as {
         status: string;
         pano_id?: string;
@@ -24,8 +24,12 @@ export function googleProvider(key: string, fetchImpl: typeof fetch = fetch): Im
         copyright?: string;
         error_message?: string;
       };
-      if (body.status === 'REQUEST_DENIED') throw new Error(`google: ${body.error_message ?? 'request denied'}`);
-      if (body.status !== 'OK' || !body.pano_id || !body.location) return null;
+      // https://developers.google.com/maps/documentation/streetview/metadata#status-codes
+      if (body.status === 'ZERO_RESULTS' || body.status === 'NOT_FOUND') return null;
+      if (body.status === 'REQUEST_DENIED') throw new ImageryError(`google: ${body.error_message ?? 'request denied'}`, 'auth');
+      if (body.status === 'OVER_QUERY_LIMIT' || body.status === 'UNKNOWN_ERROR') throw new ImageryError(`google: ${body.status}`, 'retryable');
+      if (body.status !== 'OK') throw new ImageryError(`google: ${body.status} ${body.error_message ?? ''}`, 'request');
+      if (!body.pano_id || !body.location) return null;
       if (!/google/i.test(body.copyright ?? '')) return null;
       return { lat: body.location.lat, lon: body.location.lng, panoId: body.pano_id, credit: body.copyright ?? '© Google' };
     },

@@ -4,14 +4,16 @@
  * sessions or a shared bus (see docs/ADR-003).
  */
 import { randomBytes, randomUUID } from 'node:crypto';
-import { and, eq, sql } from 'drizzle-orm';
-import { locations, matchPlayers, matches, users, type Db, type UserRow } from '@earthnow/db';
+import { and, eq, inArray, sql } from 'drizzle-orm';
+import { locations, maps, matchPlayers, matches, users, type Db, type UserRow } from '@earthnow/db';
 import {
+  MATCH_FORMATS,
   MOVE_MODES,
   TIME_LIMITS,
   elo,
   type ClientMessage,
   type MapSummary,
+  type MatchFormat,
   type PartySettings,
   type PartyState,
   type ServerMessage,
@@ -20,6 +22,7 @@ import type { Config } from '../config.ts';
 import { countryRef } from '../countries.ts';
 import { GameError, type Game } from '../game.ts';
 import { DEFAULT_TIMING, Match, MatchError, type MatchLocation, type MatchResult, type MatchTiming } from './match.ts';
+import type { Friends } from '../friends.ts';
 
 export interface Socket {
   send(data: string): void;
@@ -39,11 +42,15 @@ interface Party {
   members: string[];
   settings: PartySettings;
   matchId: string | null;
+  starting: boolean;
   leaveTimers: Map<string, () => void>;
+  /** Teams format: member id → 0 or 1. */
+  teams: Map<string, number>;
 }
 
 const PARTY_MAX = 8;
 const PARTY_GRACE_MS = 60_000;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DUEL_SETTINGS = { move: 'move' as const, timeLimit: 0, rounds: 0 };
 
 export interface HubOptions {
@@ -53,9 +60,11 @@ export interface HubOptions {
 }
 
 export class Hub {
+  /** Set by the app once both exist (friends need the hub's presence; invites need friends). */
+  friends: Friends | null = null;
   private conns = new Set<Conn>();
   private byUser = new Map<string, Set<Conn>>();
-  private queues: Record<'ranked' | 'casual', { userId: string; since: number }[]> = { ranked: [], casual: [] };
+  private queues: Record<'ranked' | 'casual', { userId: string; rating: number; since: number }[]> = { ranked: [], casual: [] };
   private parties = new Map<string, Party>();
   private partyOf = new Map<string, string>();
   readonly matches = new Map<string, Match>();
@@ -111,6 +120,11 @@ export class Hub {
     const conn = [...this.conns].find((c) => c.socket === socket);
     if (!conn) return;
     this.conns.delete(conn);
+    this.detach(conn);
+  }
+
+  /** Removes a socket from its user; if it was their last one, they go offline. */
+  private detach(conn: Conn): void {
     const uid = conn.user?.id;
     if (!uid) return;
     const set = this.byUser.get(uid);
@@ -145,16 +159,27 @@ export class Hub {
   }
 
   private async handle(conn: Conn, msg: ClientMessage): Promise<void> {
-    if (msg.t === 'ping') return this.send(conn, { t: 'pong' });
+    if (msg.t === 'ping') return this.send(conn, { t: 'pong', now: this.now() });
     if (msg.t === 'hello') {
-      if (typeof msg.guestId !== 'string' || !/^[0-9a-f-]{36}$/i.test(msg.guestId)) throw new GameError(400, 'guest_id_required');
+      if (typeof msg.guestId !== 'string' || !UUID_RE.test(msg.guestId)) throw new GameError(400, 'guest_id_required');
       const user = await this.game.guest(msg.guestId.toLowerCase());
       if (user.banned) throw new GameError(403, 'banned');
+      if (conn.user && conn.user.id !== user.id) this.detach(conn);
       conn.user = user;
       const set = this.byUser.get(user.id) ?? new Set();
       set.add(conn);
       this.byUser.set(user.id, set);
-      this.send(conn, { t: 'welcome', userId: user.id });
+      const live = [...this.matches.values()].filter((m) => m.isPlayer(user.id)).map((m) => m.id);
+      this.send(conn, { t: 'welcome', userId: user.id, now: this.now(), matchIds: live });
+      // Full state so a reconnecting client never shows stale queue/party/match views.
+      const queued = (['ranked', 'casual'] as const).find((k) => this.queues[k].some((q) => q.userId === user.id));
+      const entry = queued ? this.queues[queued].find((q) => q.userId === user.id) : undefined;
+      this.send(conn, {
+        t: 'queue.status',
+        waiting: !!entry,
+        since: entry ? new Date(entry.since).toISOString() : null,
+        ranked: queued === 'ranked',
+      });
       // Reattach to anything in progress.
       for (const m of this.matches.values()) {
         if (m.isPlayer(user.id)) {
@@ -168,6 +193,8 @@ export class Hub {
         party.leaveTimers.get(user.id)?.();
         party.leaveTimers.delete(user.id);
         this.publishParty(party);
+      } else {
+        this.send(conn, { t: 'party.closed', reason: 'none' });
       }
       return;
     }
@@ -187,13 +214,18 @@ export class Hub {
       case 'party.join':
         return this.joinParty(me, String(msg.code ?? '').toUpperCase());
       case 'party.leave':
-        return this.leaveParty(me.id);
+        this.leaveParty(me.id);
+        return this.sendUser(me.id, { t: 'party.closed', reason: 'left' });
       case 'party.settings':
         return this.partySettings(me.id, msg.settings);
       case 'party.start':
         return this.startParty(me.id);
       case 'party.kick':
         return this.kick(me.id, String(msg.playerId));
+      case 'party.invite':
+        return this.invite(me, String(msg.userId));
+      case 'party.team':
+        return this.setTeam(me.id, msg.playerId === undefined ? me.id : String(msg.playerId), Number(msg.team));
       case 'match.watch': {
         const m = this.matches.get(String(msg.matchId));
         if (!m || !m.isPlayer(me.id)) throw new GameError(404, 'match_not_found');
@@ -228,32 +260,48 @@ export class Hub {
     if (this.inActiveMatch(me.id)) throw new GameError(409, 'already_in_match');
     this.leaveQueues(me.id);
     const key = ranked ? 'ranked' : 'casual';
-    const q = this.queues[key];
-    // Closest rating among those waiting, widening with wait time.
-    const candidates = [];
-    for (const w of q) {
-      if (w.userId === me.id || !this.online(w.userId)) continue;
-      const u = await this.game.userById(w.userId);
-      if (!u) continue;
-      const window = 150 + ((this.now() - w.since) / 1000) * 25;
-      if (!ranked || Math.abs(u.rating - me.rating) <= window) candidates.push({ w, u });
-    }
-    candidates.sort((a, b) => Math.abs(a.u.rating - me.rating) - Math.abs(b.u.rating - me.rating));
+    // Pairing is synchronous (ratings are snapshotted at join time), so two
+    // players joining at once can never both claim the same opponent.
+    const now = this.now();
+    const candidates = this.queues[key].filter((w) => {
+      if (w.userId === me.id || !this.online(w.userId) || this.inActiveMatch(w.userId)) return false;
+      const window = 150 + ((now - w.since) / 1000) * 25;
+      return !ranked || Math.abs(w.rating - me.rating) <= window;
+    });
+    candidates.sort((a, b) => Math.abs(a.rating - me.rating) - Math.abs(b.rating - me.rating));
     const opp = candidates[0];
     if (!opp) {
-      q.push({ userId: me.id, since: this.now() });
-      this.sendUser(me.id, { t: 'queue.status', waiting: true, since: new Date().toISOString(), ranked });
+      this.queues[key].push({ userId: me.id, rating: me.rating, since: now });
+      this.sendUser(me.id, { t: 'queue.status', waiting: true, since: new Date(now).toISOString(), ranked });
       return;
     }
-    this.queues[key] = q.filter((x) => x !== opp.w);
-    for (const id of [me.id, opp.u.id]) this.sendUser(id, { t: 'queue.status', waiting: false, since: null, ranked });
-    const world = await this.game.mapSummary(await this.game.mapBySlug('world'));
-    await this.startMatch('duel', ranked, world, DUEL_SETTINGS, [me, opp.u]);
+    this.leaveQueues(opp.userId);
+    for (const id of [me.id, opp.userId]) this.sendUser(id, { t: 'queue.status', waiting: false, since: null, ranked });
+    try {
+      const other = await this.game.userById(opp.userId);
+      if (!other) throw new GameError(409, 'opponent_gone');
+      const world = await this.game.mapSummary(await this.game.mapBySlug('world'));
+      await this.startMatch('duel', ranked, world, DUEL_SETTINGS, [me, other]);
+    } catch (e) {
+      // Put the waiting player back; the joiner gets the error.
+      if (this.online(opp.userId) && !this.inActiveMatch(opp.userId)) {
+        this.queues[key].push(opp);
+        this.sendUser(opp.userId, { t: 'queue.status', waiting: true, since: new Date(opp.since).toISOString(), ranked });
+      }
+      throw e;
+    }
   }
 
   /* ------------------------------- matches ------------------------------ */
 
-  private async startMatch(format: 'duel' | 'classic', ranked: boolean, map: MapSummary, settings: PartySettings | typeof DUEL_SETTINGS, players: UserRow[]): Promise<Match> {
+  private async startMatch(
+    format: MatchFormat,
+    ranked: boolean,
+    map: MapSummary,
+    settings: PartySettings | typeof DUEL_SETTINGS,
+    players: UserRow[],
+    teams?: Map<string, number>,
+  ): Promise<Match> {
     const id = randomUUID();
     const s = { move: settings.move, timeLimit: settings.timeLimit, rounds: settings.rounds };
     const match: Match = new Match(
@@ -262,7 +310,7 @@ export class Hub {
       ranked,
       map,
       s,
-      players.map((u) => ({ id: u.id, name: u.displayName, country: u.country, rating: u.rating })),
+      players.map((u) => ({ id: u.id, name: u.displayName, country: u.country, rating: u.rating, team: teams?.get(u.id) })),
       {
         now: this.now,
         schedule: this.schedule,
@@ -271,6 +319,7 @@ export class Hub {
           for (const p of state.players) this.sendUser(p.id, { t: 'match.state', match: state });
         },
         finish: (r) => this.persist(r),
+        log: (message, err) => console.error(`[match ${id}] ${message}`, err),
       },
       this.timing,
     );
@@ -313,17 +362,23 @@ export class Hub {
       changes[a.id] = na - a.rating;
       changes[b.id] = nb - b.rating;
     }
+    // The map or a player's account may have been deleted mid-match.
+    const [mapRow] = await this.db.select({ id: maps.id }).from(maps).where(eq(maps.id, r.mapId));
+    const alive = new Set(
+      (await this.db.select({ id: users.id }).from(users).where(inArray(users.id, r.players.map((p) => p.id)))).map((u) => u.id),
+    );
     await this.db.insert(matches).values({
       id: r.matchId,
       format: r.format,
       ranked: r.ranked,
-      mapId: r.mapId,
+      mapId: mapRow ? r.mapId : null,
       settings: r.settings,
       winnerId: r.winnerId,
       summary: { history: r.history, players: r.players },
       finishedAt: new Date(this.now()),
     });
     for (const p of r.players) {
+      if (!alive.has(p.id)) continue;
       await this.db
         .insert(matchPlayers)
         .values({ matchId: r.matchId, userId: p.id, total: p.total, won: p.won, ratingChange: changes[p.id] ?? 0 })
@@ -351,7 +406,18 @@ export class Hub {
     const players = [];
     for (const id of p.members) {
       const u = await this.game.userById(id);
-      if (u) players.push({ id, name: u.displayName, country: u.country, rating: u.rating, connected: this.online(id), hp: 0, total: 0 });
+      if (u)
+        players.push({
+          id,
+          name: u.displayName,
+          country: u.country,
+          rating: u.rating,
+          connected: this.online(id),
+          hp: 0,
+          total: 0,
+          team: p.settings.format === 'teams' ? (p.teams.get(id) ?? 0) : null,
+          lives: 0,
+        });
     }
     let map: MapSummary | null = null;
     try {
@@ -363,9 +429,11 @@ export class Hub {
   }
 
   private publishParty(p: Party): void {
-    void this.partyState(p).then((party) => {
-      for (const id of p.members) this.sendUser(id, { t: 'party.state', party });
-    });
+    this.partyState(p)
+      .then((party) => {
+        for (const id of p.members) this.sendUser(id, { t: 'party.state', party });
+      })
+      .catch((e) => console.error('[hub] party state', e));
   }
 
   private async createParty(me: UserRow): Promise<void> {
@@ -376,7 +444,9 @@ export class Hub {
       members: [me.id],
       settings: { mapSlug: 'world', format: 'classic', move: 'move', timeLimit: 120, rounds: 5 },
       matchId: null,
+      starting: false,
       leaveTimers: new Map(),
+      teams: new Map([[me.id, 0]]),
     };
     this.parties.set(party.code, party);
     this.partyOf.set(me.id, party.code);
@@ -390,7 +460,36 @@ export class Hub {
     if (party.members.length >= PARTY_MAX) throw new GameError(409, 'party_full');
     this.leaveParty(me.id);
     party.members.push(me.id);
+    party.teams.set(me.id, this.smallerTeam(party));
     this.partyOf.set(me.id, code);
+    this.publishParty(party);
+  }
+
+  /** The side a newcomer joins: the one with fewer members (team 0 on a tie). */
+  private smallerTeam(party: Party): number {
+    const n1 = party.members.filter((m) => party.teams.get(m) === 1).length;
+    const n0 = party.members.filter((m) => party.teams.get(m) === 0).length;
+    return n1 < n0 ? 1 : 0;
+  }
+
+  /** Ask an online friend to join your party. */
+  private async invite(me: UserRow, target: string): Promise<void> {
+    const code = this.partyOf.get(me.id);
+    if (!code || !this.parties.has(code)) throw new GameError(404, 'party_not_found');
+    if (!this.friends || !UUID_RE.test(target) || !(await this.friends.areFriends(me.id, target))) throw new GameError(403, 'not_friends');
+    if (!this.online(target)) throw new GameError(409, 'friend_offline');
+    this.sendUser(target, { t: 'party.invite', code, from: { id: me.id, name: me.displayName } });
+    this.sendUser(me.id, { t: 'party.invited', userId: target });
+  }
+
+  /** Teams: anyone can switch sides; the host can move others. */
+  private setTeam(userId: string, target: string, team: number): void {
+    const code = this.partyOf.get(userId);
+    const party = code ? this.parties.get(code) : undefined;
+    if (!party) throw new GameError(404, 'party_not_found');
+    if (target !== userId && party.hostId !== userId) throw new GameError(403, 'host_only');
+    if (!party.members.includes(target) || (team !== 0 && team !== 1)) throw new GameError(400, 'invalid_team');
+    party.teams.set(target, team);
     this.publishParty(party);
   }
 
@@ -402,6 +501,7 @@ export class Hub {
     party.leaveTimers.get(userId)?.();
     party.leaveTimers.delete(userId);
     party.members = party.members.filter((m) => m !== userId);
+    party.teams.delete(userId);
     if (party.matchId) this.matches.get(party.matchId)?.leave(userId);
     if (party.members.length === 0) {
       this.parties.delete(party.code);
@@ -427,7 +527,7 @@ export class Hub {
       if (!map.published) throw new GameError(404, 'map_not_found');
       s.mapSlug = map.slug;
     }
-    if (patch.format === 'duel' || patch.format === 'classic') s.format = patch.format;
+    if (MATCH_FORMATS.includes(patch.format as never)) s.format = patch.format!;
     if (MOVE_MODES.includes(patch.move as never)) s.move = patch.move!;
     if (TIME_LIMITS.includes(patch.timeLimit as never)) s.timeLimit = patch.timeLimit!;
     if (Number.isInteger(patch.rounds) && patch.rounds! >= 1 && patch.rounds! <= 10) s.rounds = patch.rounds!;
@@ -437,17 +537,49 @@ export class Hub {
 
   private async startParty(userId: string): Promise<void> {
     const party = this.hostParty(userId);
+    if (party.starting) throw new GameError(409, 'already_running');
+    party.starting = true;
+    try {
+      await this.startPartyMatch(party);
+    } finally {
+      party.starting = false;
+    }
+  }
+
+  private async startPartyMatch(party: Party): Promise<void> {
     const running = party.matchId ? this.matches.get(party.matchId) : undefined;
     if (running && running.phase !== 'finished') throw new GameError(409, 'already_running');
     const present = party.members.filter((m) => this.online(m));
-    if (party.settings.format === 'duel' && present.length !== 2) throw new GameError(409, 'duel_needs_two');
+    const format = party.settings.format;
+    if (format === 'duel' && present.length !== 2) throw new GameError(409, 'duel_needs_two');
+    if (format === 'elimination' && present.length < 2) throw new GameError(409, 'not_enough_players');
+    if (format === 'teams') {
+      const sides = new Set(present.map((id) => party.teams.get(id) ?? 0));
+      if (sides.size !== 2) throw new GameError(409, 'teams_need_two_sides');
+    }
     if (present.length < 1) throw new GameError(409, 'not_enough_players');
+    const busy = present.filter((id) => this.inActiveMatch(id));
+    if (busy.length) throw new GameError(409, 'player_in_match');
     const players = (await Promise.all(present.map((id) => this.game.userById(id)))).filter((u): u is UserRow => !!u);
-    const map = await this.game.mapSummary(await this.game.mapBySlug(party.settings.mapSlug));
-    const settings = party.settings.format === 'duel' ? { ...party.settings, rounds: 0 } : party.settings;
-    const match = await this.startMatch(party.settings.format, false, map, settings, players);
+    const mapRow = await this.game.mapBySlug(party.settings.mapSlug);
+    const available = await this.locationCount(mapRow.id);
+    const needed = format === 'duel' || format === 'teams' ? 5 : format === 'elimination' ? 10 : party.settings.rounds;
+    if (available < needed) throw new GameError(409, 'map_too_small');
+    const map = await this.game.mapSummary(mapRow);
+    for (const id of present) this.leaveQueues(id);
+    for (const id of present) this.sendUser(id, { t: 'queue.status', waiting: false, since: null, ranked: false });
+    const settings = format === 'classic' ? party.settings : { ...party.settings, rounds: 0 };
+    const match = await this.startMatch(format, false, map, settings, players, party.teams);
     party.matchId = match.id;
     this.publishParty(party);
+  }
+
+  private async locationCount(mapId: string): Promise<number> {
+    const [r] = await this.db
+      .select({ n: sql<number>`count(*)::int` })
+      .from(locations)
+      .where(and(eq(locations.mapId, mapId), eq(locations.provider, this.config.provider), eq(locations.disabled, false)));
+    return Number(r?.n ?? 0);
   }
 
   private kick(userId: string, target: string): void {

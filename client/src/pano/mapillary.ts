@@ -13,10 +13,11 @@ export const mountMapillary: PanoMount = async (el, { pano, move, config, onRead
   const container = document.createElement('div');
   container.className = 'pano-fill';
   el.appendChild(container);
+  // No imageId here: with one, the viewer is "not navigable" until its own load
+  // finishes and our moveTo below would be rejected. moveTo also reports errors.
   const viewer = new Viewer({
     accessToken: config.mapillaryToken,
     container,
-    imageId: pano.panoId,
     trackResize: true,
     component: {
       attribution: false,
@@ -36,13 +37,23 @@ export const mountMapillary: PanoMount = async (el, { pano, move, config, onRead
       pointer: locked ? false : { dragPan: true, scrollZoom: true, touchZoom: true, earthControl: false },
     },
   });
-  const center = () => viewer.setCenter([(((pano.heading % 360) + 360) % 360) / 360, 0.5]);
-  viewer.on('load', () => {
-    center();
-    onReady?.();
-  });
-  viewer.on('dataloading', () => {});
-  viewer.moveTo(pano.panoId).catch((e: Error) => onError?.(e.message));
+  // setCenter takes image coordinates: x = 0.5 is the camera's own direction,
+  // so turn the compass heading (clockwise from north) into an offset from it.
+  let compass = 0;
+  const center = () => {
+    const x = ((((pano.heading - compass) / 360 + 0.5) % 1) + 1) % 1;
+    viewer.setCenter([x, 0.5]);
+  };
+  let destroyed = false;
+  viewer
+    .moveTo(pano.panoId)
+    .then((img) => {
+      if (destroyed) return;
+      compass = img.computedCompassAngle ?? img.compassAngle ?? 0;
+      center();
+      onReady?.();
+    })
+    .catch((e: Error) => !destroyed && onError?.(e.message));
   return {
     reset() {
       void viewer
@@ -54,6 +65,7 @@ export const mountMapillary: PanoMount = async (el, { pano, move, config, onRead
         .catch(() => {});
     },
     destroy() {
+      destroyed = true;
       viewer.remove();
       container.remove();
     },
